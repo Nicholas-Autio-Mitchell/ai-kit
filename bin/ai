@@ -31,7 +31,9 @@ set -euo pipefail
 #
 # Claude follows its latest-model alias. Codex stays on Astra unless overridden;
 # its optional CLI catalogue determines the selected model's highest effort.
-# Compatibility verified with Codex CLI 0.154.0.
+# Compatibility verified with Codex CLI 0.162.1 (previously 0.154.0): every flag
+# below — -C, -m, -c, --enable, --search, --dangerously-bypass-approvals-and-sandbox
+# — is still present in that release's --help.
 #
 # Usage:
 #   ai [wt] [claude|codex] [options] [--] [prompt...]
@@ -136,10 +138,12 @@ usage() {
     cat >&2 <<EOF
 usage: $invoked_as [wt] [claude|codex] [options] [--] [prompt...]
        $invoked_as worktrees [--fix]
+       $invoked_as update [--check] [--via brew|standalone] [claude|codex]
 
   $invoked_as "Fix the failing auth test"     # in place, current branch, Claude
   $invoked_as wt codex "Risky refactor"       # isolated worktree + branch, Codex
   $invoked_as worktrees                       # audit this repo's worktrees + direnv
+  $invoked_as update --check                  # are claude and codex up to date?
 
 Run '$invoked_as --help' for modes, options, examples, and environment overrides.
 EOF
@@ -154,6 +158,7 @@ specialist subagents, and a logbook/commit discipline that leaves clean history.
 usage:
   $invoked_as [wt] [claude|codex] [options] [--] [prompt...]
   $invoked_as worktrees [--fix]
+  $invoked_as update [--check] [--via brew|standalone] [claude|codex]
 
 Both the mode and the agent are optional, so the shortest useful form is just
 "$invoked_as 'your task'" — in place, on your current branch, with Claude.
@@ -174,6 +179,18 @@ modes:
                     sits relative to the canonical root and what direnv makes of
                     it, then prints the commands to fix anything off. Read-only
                     unless you add --fix. Runs no agent.
+
+  update            UPDATE THE AGENT CLIs. Works out how claude and codex were
+                    installed and upgrades the two methods it can drive safely:
+                    Homebrew ('brew upgrade --cask/--formula') and each CLI's own
+                    installer ('claude update' / 'codex update'). Anything else —
+                    an npm/pnpm/yarn/bun global, a distro package — is DETECTED
+                    and reported with the command to run yourself, never touched.
+                    Runs no agent, needs no repository, and never installs a CLI
+                    you do not already have. Add --check to only report. This
+                    updates the agent CLIs, NOT ai-kit itself — for that,
+                    'git pull && ./install.sh -y' in your checkout. The only part
+                    of $invoked_as that makes network calls.
 
 agents:
   claude  (default) Claude Code — latest Opus, --effort max, ultracode
@@ -203,6 +220,18 @@ options:
 
       --fix         'worktrees' mode only. Actually apply the repairs it lists
                     instead of only printing them.
+
+      --check       'update' mode only. Report what is out of date and stop,
+                    changing nothing. Exit 0 = all current, 1 = something is out
+                    of date or missing, 3 = the latest version could not be
+                    determined (offline, or the release endpoint did not answer).
+
+      --via METHOD  'update' mode only, and one named tool only. Assert how that
+                    CLI was installed when the automatic detection cannot tell:
+                    brew or standalone — the only two methods that are upgraded.
+                    It overrides the classification and nothing else: 'brew' with
+                    no usable Homebrew is an error rather than a guess, and no
+                    method ever uses sudo.
 
   -h, --help        Show this help.
 
@@ -234,6 +263,15 @@ examples:
     $invoked_as worktrees          # report only
     $invoked_as worktrees --fix    # move stray trees, prune dead ones, re-link
                                    # and re-allow .envrc
+
+  Keeping the agent CLIs current (no repository needed):
+    $invoked_as update --check     # report only; changes nothing
+    $invoked_as update             # upgrade whichever of them is out of date
+    $invoked_as update codex       # just that one
+    $invoked_as update claude --via brew   # when detection cannot tell and you
+                                           # know it came from Homebrew
+    AI_KIT_CODEX_BINARY=/opt/x/bin/codex $invoked_as update codex
+    AI_UPDATE_OFFLINE=1 $invoked_as update --check   # no network at all
 
   Equivalent wrappers (all worktree mode):
     claude-wt "Add a rate limiter"             ==  $invoked_as wt claude "..."
@@ -280,6 +318,26 @@ environment overrides (legacy AGENT_WT_* names still honored):
   AGENT_NO_GPG_SIGN             1 — commits unsigned, scoped to this run so the
                                 auto-commits never block on a passphrase prompt
                                 (0 keeps your normal signing)
+  AGENT_UPDATE_TIMEOUT          900 — seconds an 'update' upgrade may run before
+                                it is killed; 0 removes the clock. A Homebrew
+                                prefix that is not the default cannot use bottles
+                                and BUILDS FROM SOURCE, which legitimately runs
+                                past 15 minutes — set 0 there.
+  AGENT_UPDATE_CHANNEL          '' — force Claude's release channel for 'update'
+                                (stable or latest). Normally read from the cask
+                                name, or from 'claude doctor'.
+  AI_UPDATE_OFFLINE             0 — 1 makes 'update' touch no network at all;
+                                every lookup then reports 'unknown'.
+  AI_UPDATE_FETCH_CMD           '' — a TEST SEAM for 'update': a command line,
+                                handed the URL as its last argument, that must
+                                print the body. Setting it replaces the HTTP
+                                client entirely, so nothing else fetches. Not for
+                                ordinary use — AI_UPDATE_OFFLINE=1 is how you say
+                                "no network".
+  AI_KIT_CLAUDE_BINARY          '' — inspect and upgrade THIS binary instead of
+  AI_KIT_CODEX_BINARY           the one on PATH. Set but not executable is an
+                                error for that tool, never a silent fall back to
+                                PATH. (AI_KIT_, not AGENT_, by request.)
 
 notes:
   * Claude uses the 'opus' alias. Codex defaults to Astra even with a missing
@@ -299,11 +357,32 @@ notes:
     anything. Not 'agent', though: the cursor-agent installer owns
     ~/.local/bin/agent and recreates it on every self-update, silently
     overwriting anything parked there.
-  * The bare words 'wt', 'here', 'worktrees', 'claude' and 'codex' are only
-    recognized while they lead the argument list — everything from the first
+  * The bare words 'wt', 'here', 'worktrees', 'update', 'claude' and 'codex' are
+    only recognized while they lead the argument list — everything from the first
     other word on is the prompt. So "$invoked_as claude wt ..." keeps 'wt' in the
     prompt, and a task that genuinely starts with one of those words just needs
     quoting: "$invoked_as 'codex is failing to build'" runs Claude on that prompt.
+  * 'update' is the one bare word that also reads as ordinary English, so it gets
+    a sharper rule: a word-only argument list is a PROMPT unless it is exactly a
+    command form, while an argument list containing an update flag (--check,
+    --via) is a COMMAND and anything unrecognized in it is an error. Flags are
+    never prompt material — the parser already rejects any unknown '-*' — so one
+    of them commits the whole line. Hence:
+        $invoked_as update                      -> the subcommand
+        $invoked_as update --check codex        -> the subcommand
+        $invoked_as update the README for typos -> a prompt, the agent runs
+        $invoked_as update codex extra          -> a prompt (words only)
+        $invoked_as update --check extra        -> error: 'extra' after a flag
+    A '--' after 'update' is literal prompt text, exactly as it is in
+    "$invoked_as fix -- the bug": by then the line has already been classified as
+    a prompt, and '--' only ends option parsing in leading option position. So
+    "$invoked_as update -- the README" is the prompt "update -- the README". To
+    force a prompt either way, quote it or put '--' first:
+        $invoked_as -- update anything          /  $invoked_as 'update anything'
+  * '$invoked_as update' is the only part of this script that makes network calls:
+    one release-pointer lookup per CLI, plus whatever Homebrew does on its own.
+    AI_UPDATE_OFFLINE=1 disables all of it. It never installs a CLI you do not
+    have, never uses sudo, and never updates ai-kit itself.
   * Worktrees are always grouped next to the MAIN worktree, even when you launch
     from inside another worktree. Everything for one repository therefore lands in
     one predictable directory, which is also what makes the direnv blessing and
@@ -343,6 +422,49 @@ first_defined() {
     if [ -n "${!n+x}" ]; then printf '%s' "${!n}"; return 0; fi
   done
   return 1
+}
+
+# ai_update_form <args after 'update'> — classify the tail of the line WITHOUT
+# consuming it. Sets _update_form to exact | flagged | prompt, and _update_junk to
+# the token that stopped the scan.
+#
+# 'update' is the one subcommand word that also reads as ordinary English, so it
+# cannot use the plain "leading bare word wins" rule: "ai update the README to
+# mention the new flag" has to run the agent. The split is structural rather than
+# stylistic — bare words are prompt material, which is this CLI's entire premise,
+# whereas flags never are, since the parser already rejects any unknown '-*'
+# before '--'. So one recognised flag commits the whole line to the subcommand,
+# and from there strictness is free.
+#
+# This lives here, in bin/ai, and must stay here: the grammar has to be able to
+# reject or accept 'update' with zero dependency on agent.d/lib/update.sh, so a
+# missing or broken lib degrades to a clean exit 2 for 'update' alone and can
+# never affect an agent launch. (INVARIANT G1.)
+ai_update_form() {
+  _update_form=exact; _update_junk=""
+  local saw_flag=0 skip=0 t
+  for t in "$@"; do
+    # '--via' takes a value; that value must not be mistaken for prompt text.
+    if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+    case "$t" in
+      --check|-h|--help) saw_flag=1 ;;
+      --via)             saw_flag=1; skip=1 ;;
+      --via=*)           saw_flag=1 ;;
+      claude|codex)      ;;
+      # '--' must be matched before '-*'. It behaves exactly like a bare word:
+      # prompt material until a flag has committed the line to the subcommand.
+      --)                _update_junk="$t"
+                         if [ "$saw_flag" -eq 1 ]; then _update_form=flagged
+                         else _update_form=prompt; fi
+                         return 0 ;;
+      -*)                _update_junk="$t"; _update_form=flagged; return 0 ;;
+      *)                 _update_junk="$t"
+                         if [ "$saw_flag" -eq 1 ]; then _update_form=flagged
+                         else _update_form=prompt; fi
+                         return 0 ;;
+    esac
+  done
+  return 0
 }
 
 # ---- Resolve this script's real directory (follow symlinks) ----------------
@@ -431,15 +553,39 @@ base=""          # empty => resolve to current/default branch below
 name=""
 audit=0          # 'worktrees' mode: report on the repo's worktrees, run no agent
 audit_fix=0      # ... and actually apply the repairs
+update_mode=0    # 'update' mode: upgrade the agent CLIs, run no agent
+update_check=0   # ... report only, change nothing
+update_tool=""   # ... limited to one of claude|codex
+update_via=""    # ... with the install method asserted rather than detected
+# An EXPLICIT worktree/in-place request: '--wt', '--here', or a leading bare 'wt'
+# / 'here'. 'update' cuts no worktree, so it refuses to run alongside one.
+#
+# This does NOT rescue the *-wt wrappers, and nothing here tries to. They pass
+# 'wt' themselves, so their argument order decides what 'update' means before
+# mode_set is ever consulted:
+#   codex-wt update  ->  'ai wt --agent codex update'. The agent is already set
+#                        when 'update' is reached, so it is PROMPT text and the
+#                        run is an ordinary worktree launch on the prompt
+#                        "update" (outside a repository, the worktree check
+#                        rejects it first).
+#   agent-wt update  ->  'ai wt update'. No agent yet, so 'update' is the
+#                        subcommand, and the bare 'wt' then fails the guard
+#                        below with "runs no agent and cuts no worktree".
+# Updating the CLIs from a worktree wrapper is not a thing: run '$invoked_as
+# update'. mode_set earns its keep for a hand-made symlink (ln -s ai foo-wt) and
+# for an explicit '--wt'/'here' on the command line.
+mode_set=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --wt|--worktree)
       use_worktree=1
+      mode_set=1
       shift
       ;;
     --here|--in-place|--no-wt)
       use_worktree=0
+      mode_set=1
       shift
       ;;
     --fix)
@@ -451,14 +597,57 @@ while [ "$#" -gt 0 ]; do
       # that they are part of the prompt.
       if [ -z "$agent" ]; then
         case "$1" in
-          wt)        use_worktree=1 ;;
-          here)      use_worktree=0 ;;
+          wt)        use_worktree=1; mode_set=1 ;;
+          here)      use_worktree=0; mode_set=1 ;;
           worktrees) audit=1 ;;
         esac
         shift
       else
         break
       fi
+      ;;
+    update)
+      # Only before the agent is chosen; after that it is prompt, exactly as
+      # 'wt' is. So `$invoked_as codex update` runs Codex on the prompt "update".
+      if [ -n "$agent" ]; then break; fi
+      shift
+      ai_update_form ${1+"$@"}
+      case "$_update_form" in
+        prompt)
+          # The scan has decided: 'update' was never a subcommand word, it is the
+          # first word of the prompt. Put it back and stop option parsing — and
+          # give nothing after it special treatment, including a '--', which is
+          # literal prompt text here exactly as it is in "ai fix -- the bug".
+          set -- update ${1+"$@"}
+          break ;;
+        flagged)
+          echo "Unexpected argument '$_update_junk' after 'update'." >&2
+          echo "usage: $invoked_as update [--check] [--via brew|standalone] [claude|codex]" >&2
+          echo "To run it as a prompt instead, quote it:" >&2
+          echo "  $invoked_as $(printf '%q' "update $*")" >&2
+          exit 2 ;;
+      esac
+      update_mode=1
+      # The form scan already proved every remaining token is one of these, so
+      # this loop needs no error arm of its own.
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --check)   update_check=1 ;;
+          -h|--help) usage 0 ;;
+          --via)
+            [ "$#" -ge 2 ] || { echo "--via needs a value: brew or standalone." >&2; exit 2; }
+            update_via="$2"; shift ;;
+          --via=*)   update_via="${1#--via=}" ;;
+          claude|codex)
+            if [ -n "$update_tool" ] && [ "$update_tool" != "$1" ]; then
+              echo "Name at most one of 'claude' or 'codex' after 'update'." >&2
+              exit 2
+            fi
+            update_tool="$1" ;;
+        esac
+        shift
+      done
+      break
       ;;
     -a|--agent)
       [ "$#" -ge 2 ] || usage
@@ -501,6 +690,17 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# --via needs no "only applies to update" guard of its own: outside the update)
+# case it reaches the main loop's -*) arm and is rejected there as unknown.
+case "$update_via" in
+  ""|brew|standalone) ;;
+  *) echo "Unknown --via method '$update_via' (use brew or standalone)." >&2; exit 2 ;;
+esac
+if [ -n "$update_via" ] && [ -z "$update_tool" ]; then
+  echo "--via applies to one tool: $invoked_as update claude --via $update_via" >&2
+  exit 2
+fi
+
 # The agent name is optional; Claude is the default.
 agent="${agent:-claude}"
 case "$agent" in
@@ -508,9 +708,10 @@ case "$agent" in
   *) echo "Invalid agent: '$agent' (use codex or claude)." >&2; usage ;;
 esac
 
-# Resolve only for Codex launches: help, worktree audits, and Claude must work
-# even if a Codex override has no known capabilities.
-if [ "$agent" = codex ] && [ "$audit" -eq 0 ] && [ -z "$CODEX_EFFORT" ]; then
+# Resolve only for Codex launches: help, worktree audits, CLI updates, and Claude
+# must all work even if a Codex override has no known capabilities.
+if [ "$agent" = codex ] && [ "$audit" -eq 0 ] && [ "$update_mode" -eq 0 ] \
+   && [ -z "$CODEX_EFFORT" ]; then
   CODEX_EFFORT="$(codex_effort "$CODEX_MODEL" || true)"
   if [ -z "$CODEX_EFFORT" ]; then
     case "$CODEX_MODEL" in
@@ -535,6 +736,59 @@ fi
 if [ "$audit_fix" -eq 1 ] && [ "$audit" -eq 0 ]; then
   echo "--fix only applies to '$invoked_as worktrees'." >&2
   exit 2
+fi
+# --fix needs no guard of its own here: audit is 0 in update mode, so the check
+# just above already fires for '$invoked_as update --fix'.
+if [ "$update_mode" -eq 1 ]; then
+  [ "$audit" -eq 0 ]    || { echo "'update' and 'worktrees' are different subcommands; pick one." >&2; exit 2; }
+  [ "$mode_set" -eq 0 ] || { echo "'update' runs no agent and cuts no worktree; drop 'wt'/'here'." >&2; exit 2; }
+  [ -z "$base" ]        || { echo "--base does not apply to '$invoked_as update'." >&2; exit 2; }
+  [ -z "$name" ]        || { echo "--name does not apply to '$invoked_as update'." >&2; exit 2; }
+fi
+# Belt and braces: --check is not a main-loop option today, so an unknown-option
+# error already catches it elsewhere. This keeps the message right if it ever is.
+if [ "$update_check" -eq 1 ] && [ "$update_mode" -eq 0 ]; then
+  echo "--check only applies to '$invoked_as update'." >&2
+  exit 2
+fi
+
+# ---- 'update': upgrade the agent CLIs --------------------------------------
+# Dispatched here, before the prompt is assembled and before the repository
+# lookup below (which hard-rejects a non-repo), because updating a CLI has
+# nothing to do with git. ai_prefer_homebrew has already run by this point, so on
+# macOS the brew-augmented PATH is live and `command -v codex` finds a Homebrew
+# codex even when the caller's own PATH would not.
+#
+# The lib is sourced HERE and nowhere earlier. Everything above decided this is
+# an update run without reading a byte of it, so a missing or syntactically
+# broken agent.d/lib/update.sh can only ever produce the exit 2 below — it can
+# never abort an agent launch. (INVARIANT G1; do not hoist this.)
+if [ "$update_mode" -eq 1 ]; then
+  _update_lib=""
+  for _c in "$script_dir/agent.d/lib/update.sh" "$script_dir/../agent.d/lib/update.sh"; do
+    if [ -f "$_c" ]; then _update_lib="$_c"; break; fi
+  done
+  if [ -z "$_update_lib" ]; then
+    echo "'$invoked_as update' needs agent.d/lib/update.sh, which is missing from this" >&2
+    echo "installation. Re-run install.sh to restore the payload." >&2
+    exit 2
+  fi
+  . "$_update_lib"
+  unset _update_lib _c
+  # A file that parses but stops short of run_update is a half-copied payload.
+  # Without this it would surface as a bare "command not found" and exit 127.
+  if ! command -v run_update >/dev/null 2>&1; then
+    echo "agent.d/lib/update.sh loaded but defines no run_update; the payload is" >&2
+    echo "incomplete. Re-run install.sh to restore it." >&2
+    exit 2
+  fi
+  # Captured rather than `run_update; exit $?`: under `set -e` a non-zero return
+  # exits the script on the spot, so the `exit` line only ever ran for status 0
+  # and any statement placed between the two would be silently unreachable on
+  # every other path. This says what it means — run it, keep the status, exit.
+  _update_rc=0
+  run_update || _update_rc=$?
+  exit "$_update_rc"
 fi
 
 # Prompt is optional: with a prompt the agent runs it immediately; without one,
