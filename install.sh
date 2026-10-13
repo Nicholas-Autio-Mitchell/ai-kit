@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install.sh — install the ai-kit launcher and its subagent team on Linux.
+# install.sh — install the ai-kit launcher and its subagent team on Linux/macOS.
 #
 # The pattern: a self-contained PAYLOAD directory plus OWNED SYMLINKS.
 #
@@ -35,8 +35,7 @@ set -euo pipefail
 #   --uninstall       hand off to uninstall.sh
 #   -h, --help        this text
 #
-# Targets Linux (developed and tested on Ubuntu). It asserts GNU coreutils and
-# bash >= 4 up front rather than degrading quietly on other platforms.
+# Supports Linux and macOS, including Apple's bundled Bash 3.2 and BSD utilities.
 
 # ---- Where this script lives (payload source) ------------------------------
 src="${BASH_SOURCE[0]}"
@@ -46,6 +45,9 @@ while [ -h "$src" ]; do
   case "$src" in /*) ;; *) src="$d/$src" ;; esac
 done
 REPO="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+. "$REPO/agent.d/lib/paths.sh"
+. "$REPO/agent.d/lib/platform.sh"
+ai_prefer_homebrew
 
 VERSION="$(cat "$REPO/VERSION" 2>/dev/null || echo unknown)"
 
@@ -57,7 +59,7 @@ else
 fi
 usage() {
   cat <<EOF
-install.sh — install the ai-kit launcher and its subagent team (Linux).
+install.sh — install the ai-kit launcher and its subagent team (Linux/macOS).
 
 usage:
   ./install.sh                       interactive (recommended)
@@ -140,26 +142,32 @@ abspath() {
     "~/"*) p="$HOME/${p#\~/}" ;;
   esac
   case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
-  printf '%s' "${p%/}"
+  ai_realpath "$p"
 }
 
 # ---- Preflight -------------------------------------------------------------
 head_ "ai-kit $VERSION — preflight"
 
-[ "$(uname -s)" = "Linux" ] || die "this package targets Linux (see README.md). Found: $(uname -s)"
-ok "Linux ($(uname -m))"
+platform="$(uname -s)"
+case "$platform" in
+  Linux) platform_label=Linux; git_install_hint="Install git with your distribution's package manager." ;;
+  Darwin) platform_label=macOS; git_install_hint="Install Apple Command Line Tools (xcode-select --install), or brew install git." ;;
+  *) die "supported platforms are Linux and macOS. Found: $platform" ;;
+esac
+ok "$platform_label ($(uname -m))"
 
-[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] \
-  || die "bash 4+ required (found ${BASH_VERSION:-unknown}). On Ubuntu: sudo apt install bash"
+{ [ "${BASH_VERSINFO[0]:-0}" -gt 3 ] || \
+  { [ "${BASH_VERSINFO[0]:-0}" -eq 3 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 2 ]; }; } \
+  || die "bash 3.2+ required (found ${BASH_VERSION:-unknown})."
 ok "bash ${BASH_VERSION%%(*}"
 
-command -v git >/dev/null 2>&1 || die "git not found. On Ubuntu: sudo apt install git"
+command -v git >/dev/null 2>&1 || die "git not found. $git_install_hint"
 git_v="$(git --version | awk '{print $3}')"
 git_major="${git_v%%.*}"; git_rest="${git_v#*.}"; git_minor="${git_rest%%.*}"
 if [ "$git_major" -lt 2 ] || { [ "$git_major" -eq 2 ] && [ "$git_minor" -lt 31 ]; }; then
   die "git >= 2.31 required (found $git_v). The launcher uses
        'git rev-parse --path-format=absolute', added in 2.31.
-       On Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt update && sudo apt install git"
+       $git_install_hint"
 fi
 ok "git $git_v"
 
@@ -251,7 +259,7 @@ fi
 owned() {
   local p="$1" t
   [ -L "$p" ] || return 1
-  t="$(readlink -f -- "$p" 2>/dev/null)" || return 1
+  t="$(ai_realpath "$p")" || return 1
   case "$t" in "$PREFIX"/*) return 0 ;; *) return 1 ;; esac
 }
 
@@ -267,7 +275,7 @@ if [ "${#conflicts[@]}" -gt 0 ]; then
   head_ "Conflict"
   say "  These already exist and were not created by ai-kit:"
   for c in "${conflicts[@]}"; do
-    say "    $c  ->  $(readlink -- "$c" 2>/dev/null || echo '(not a symlink)')"
+    say "    $c  ->  $(readlink "$c" 2>/dev/null || echo '(not a symlink)')"
   done
   say ""
   say "  Nothing has been changed. Re-run with a different name, e.g.:"
@@ -343,7 +351,13 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ok "$BIN_DIR is on your PATH" ;;
   *)
     warn "$BIN_DIR is NOT on your PATH. Add it:"
-    say  "      echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.bashrc && exec bash"
+    case "${SHELL##*/}" in
+      zsh)  shell_rc="${ZDOTDIR:-$HOME}/.zshrc" ;;
+      bash) if [ "$platform" = Darwin ]; then shell_rc="$HOME/.bash_profile"; else shell_rc="$HOME/.bashrc"; fi ;;
+      *)    shell_rc="your shell's startup file" ;;
+    esac
+    say  "      export PATH=$(printf '%q' "$BIN_DIR"):\$PATH"
+    say  "    Put that line in $shell_rc, then open a new terminal."
     ;;
 esac
 

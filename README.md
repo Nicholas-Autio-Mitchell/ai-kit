@@ -64,17 +64,23 @@ Non-interactive (CI, dotfile bootstraps, or piping into a shell):
 
 ## Requirements
 
-Linux only — developed and tested on Ubuntu. The installer checks all of this
-and tells you what is missing.
+Linux and macOS, including Apple Silicon and Intel Macs. The installer checks
+the prerequisites and tells you what is missing. On macOS it searches existing
+Homebrew tools first, then tools on your system PATH. Both Homebrew Bash and
+Apple's bundled Bash work; GNU coreutils are not required. If neither source
+provides a required tool, installation stops with setup instructions.
 
 | | |
 |---|---|
-| **bash** | 4 or newer |
+| **bash** | 3.2 or newer (included with macOS) |
 | **git** | **2.31 or newer** — the launcher uses `git rev-parse --path-format=absolute` |
 | **claude** and/or **codex** | at least one CLI on your `PATH` |
 | `python3` | *optional for launching* — reads the selected Codex model's supported effort; required by the Codex regression suite |
 | `direnv` | *optional* — lets worktree sessions inherit your project environment |
 | git `user.name` / `user.email` | set globally; the chronicler agent commits |
+
+On macOS, install Git with `xcode-select --install`, or use `brew install git`.
+The installer prints PATH setup instructions for your shell (including zsh).
 
 Ubuntu, if git is older than 2.31:
 
@@ -228,6 +234,7 @@ The full table, with the reasoning behind each default, is in
 ## Tests
 
 ```bash
+agent.d/tests/install.sh            # offline install/upgrade/uninstall coverage
 agent.d/tests/codex-launch.sh       # offline; requires python3, bash and git
 agent.d/tests/direnv-worktree.sh    # also requires direnv
 ```

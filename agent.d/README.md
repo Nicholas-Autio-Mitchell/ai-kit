@@ -602,9 +602,12 @@ The separate direnv suite is described above.
 
 ## Requirements & safety
 
-Linux only — developed and tested on Ubuntu. `install.sh` checks all of it.
+Linux and macOS (Apple Silicon and Intel). `install.sh` accepts the system
+Bash and BSD utilities on macOS. Existing Homebrew tools take precedence over
+system PATH tools; either Homebrew Bash or Apple's Bash works. Missing required
+tools produce installation guidance. GNU coreutils are not required.
 
-- **bash 4+** and **git 2.31+**. The 2.31 floor is not cosmetic: the launcher
+- **bash 3.2+** and **git 2.31+**. The 2.31 floor is not cosmetic: the launcher
   uses `git rev-parse --path-format=absolute --git-common-dir` to find the
   repository that owns a worktree. (`git worktree move` needs 2.17 and
   `git branch --show-current` needs 2.22, so 2.31 covers everything.)

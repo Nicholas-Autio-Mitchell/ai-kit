@@ -24,6 +24,9 @@ while [ -h "$src" ]; do
   case "$src" in /*) ;; *) src="$d/$src" ;; esac
 done
 HERE="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+. "$HERE/agent.d/lib/paths.sh"
+. "$HERE/agent.d/lib/platform.sh"
+ai_prefer_homebrew
 
 if [ -t 2 ]; then
   B=$'\033[1m'; DIM=$'\033[2m'; GRN=$'\033[32m'; YLW=$'\033[33m'; RED=$'\033[31m'; N=$'\033[0m'
@@ -74,7 +77,7 @@ case "$PREFIX" in
   "~/"*) PREFIX="$HOME/${PREFIX#\~/}" ;;
 esac
 case "$PREFIX" in /*) ;; *) PREFIX="$PWD/$PREFIX" ;; esac
-PREFIX="${PREFIX%/}"
+PREFIX="$(ai_realpath "$PREFIX")"
 
 manifest="$PREFIX/manifest"
 [ -f "$manifest" ] || die "no ai-kit manifest at $manifest
@@ -95,7 +98,7 @@ esac
 owned() {
   local p="$1" t
   [ -L "$p" ] || return 1
-  t="$(readlink -f -- "$p" 2>/dev/null)" || return 1
+  t="$(ai_realpath "$p")" || return 1
   case "$t" in "$PREFIX"/*) return 0 ;; *) return 1 ;; esac
 }
 
