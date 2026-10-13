@@ -10,9 +10,11 @@ set -euo pipefail
 #   ai    codex "Do the task"     # in place, with Codex instead
 #   ai wt codex "Do the task"     # isolated worktree + branch, with Codex
 #
-# Named "ai" rather than "agent" on purpose: the cursor-agent installer owns
-# ~/.local/bin/agent and recreates it on every self-update, which would silently
-# overwrite this script.
+# The command name is chosen at install time (install.sh --name) and reached
+# through a symlink; this script resolves that symlink to find agent.d/ beside
+# itself, so any name works. "agent" is the one name deliberately not offered:
+# the cursor-agent installer owns ~/.local/bin/agent and recreates it on every
+# self-update, which would silently overwrite a script parked there.
 #
 # Both agents get the same treatment in spirit: newest model, maximum reasoning
 # effort, no approval prompts, and a documentation/logbook discipline that
@@ -291,9 +293,11 @@ notes:
     AGENT_CLAUDE_PERMISSION_MODE set keeps the run unattended regardless.
     Caveat: under dontAsk anything that WOULD have prompted is denied rather than
     asked, so 'ask' rules in your org settings become hard denials.
-  * This is ~/.local/bin/ai, not 'agent': the cursor-agent installer owns
-    ~/.local/bin/agent and recreates it on every self-update, so a script parked
-    there gets silently overwritten. 'agent' is left to Cursor.
+  * The command name is set at install time and reached through a symlink, which
+    this script resolves to find agent.d/ beside itself — so it can be called
+    anything. Not 'agent', though: the cursor-agent installer owns
+    ~/.local/bin/agent and recreates it on every self-update, silently
+    overwriting anything parked there.
   * The bare words 'wt', 'here', 'worktrees', 'claude' and 'codex' are only
     recognized while they lead the argument list — everything from the first
     other word on is the prompt. So "$invoked_as claude wt ..." keeps 'wt' in the

@@ -20,19 +20,27 @@ ai wt codex "Do the task"     # isolated worktree + branch, with Codex
 The only difference between the modes is isolation. Model, effort, auto-run,
 subagent team, and logbook discipline are identical.
 
-> **Why `ai` and not `agent`?** The cursor-agent installer owns
-> `~/.local/bin/agent` and recreates that symlink on every self-update, silently
-> overwriting anything parked there. `agent` is left to Cursor; this tool lives
-> at `~/.local/bin/ai`. If you want the shorter alias anyway, `ln -sfn ai
-> ~/.local/bin/a` works and Cursor won't touch it.
+> **The command name is not fixed.** `install.sh` symlinks your chosen name at
+> the launcher, and the launcher resolves its own location through symlinks to
+> find `agent.d/` beside itself — so `ai`, `aid`, `ai-kit` or anything else all
+> work identically. This document says `ai` throughout; substitute your own.
+>
+> Two names deserve care. `agent` is owned by the cursor-agent installer, which
+> recreates `~/.local/bin/agent` on every self-update and would silently
+> overwrite anything parked there — so it is left to Cursor. And `ai` itself is
+> short and popular; the installer checks whether it is already taken on your
+> `PATH` and suggests an alternative rather than shadowing it.
 
-Worktree-mode wrappers preserve the short form:
+Optional worktree-mode shortcuts (`install.sh --shortcuts`):
 
 ```
-agent-wt  [claude|codex] "..."   ==  ai wt [claude|codex] "..."
+<cmd>-wt  [claude|codex] "..."   ==  ai wt [claude|codex] "..."
 codex-wt  "..."                  ==  ai wt codex  "..."
 claude-wt "..."                  ==  ai wt claude "..."
 ```
+
+They are separate scripts rather than bare symlinks because a `*-wt` name only
+selects worktree mode; picking the *agent* takes an argument.
 
 ---
 
@@ -187,7 +195,11 @@ direnv matches it as a raw string prefix, so `/x/wt` would also match `/x/wt-evi
 ```
 agent.d/tests/direnv-worktree.sh        # 74 assertions
 AI_TEST_ROOT=/tmp/keep agent.d/tests/direnv-worktree.sh   # keep fixtures to inspect
+AI=/path/to/ai         agent.d/tests/direnv-worktree.sh   # test a launcher elsewhere
 ```
+
+The harness locates the launcher relative to itself, so it runs unchanged from a
+git clone (`<repo>/bin/ai`) or from an installed prefix (`<prefix>/ai`).
 
 Fake `claude`/`codex` on `PATH` record their argv and the environment they
 inherited, so the suite asserts on *behaviour* — "did the `.envrc`'s variable
@@ -500,14 +512,23 @@ Code subagent format: YAML frontmatter + system-prompt body) and
 there — the change applies to every future run. Mirror any role changes in
 `agent.d/AGENTS.codex.md` so the human-readable charter stays in sync.
 
+Edits go in the **source clone**, then `./install.sh -y` to push them to the
+installed payload. Editing `<prefix>/agent.d/` directly works too, but the next
+install overwrites it.
+
 ## File layout
 
+Installed payload — self-contained, versioned, and never on your `PATH`:
+
 ```
-~/.local/bin/
+<prefix>/                    # default: ${XDG_DATA_HOME:-~/.local/share}/ai-kit
 ├── ai                       # main script (in-place by default, `wt` for a worktree)
 ├── agent-wt                 # wrapper -> ai wt
 ├── codex-wt                 # wrapper -> ai wt --agent codex
 ├── claude-wt                # wrapper -> ai wt --agent claude
+├── manifest                 # what install.sh created, for a surgical uninstall
+├── uninstall.sh
+├── VERSION
 └── agent.d/
     ├── README.md            # this file
     ├── AGENTS.codex.md      # human-readable team charter (reference)
@@ -515,16 +536,45 @@ there — the change applies to every future run. Mirror any role changes in
     ├── agents/              # 7 Claude subagents (.md)  -> .claude/agents/
     │   ├── architect.md   precision-coder.md   critic.md   chronicler.md
     │   └── test-engineer.md   researcher.md   security-auditor.md
-    └── codex-agents/        # 7 Codex subagents (.toml) -> .codex/agents/
-        ├── architect.toml   precision-coder.toml   critic.toml   chronicler.toml
-        └── test-engineer.toml   researcher.toml   security-auditor.toml
+    ├── codex-agents/        # 7 Codex subagents (.toml) -> .codex/agents/
+    │   ├── architect.toml   precision-coder.toml   critic.toml   chronicler.toml
+    │   └── test-engineer.toml   researcher.toml   security-auditor.toml
+    └── tests/               # the 74-assertion suite
 ```
+
+Only symlinks land in a directory on your `PATH`:
+
+```
+<bin-dir>/<cmd>       -> <prefix>/ai            # default: ~/.local/bin/ai
+<bin-dir>/<cmd>-wt    -> <prefix>/agent-wt      # --shortcuts only
+<bin-dir>/claude-wt   -> <prefix>/claude-wt     # --shortcuts only
+<bin-dir>/codex-wt    -> <prefix>/codex-wt      # --shortcuts only
+```
+
+In the git repo the four scripts live under `bin/` instead of at the top level;
+`install.sh` flattens them into `<prefix>/` so `ai` finds `agent.d/` beside
+itself. That is the only difference between the two trees.
 
 ## Requirements & safety
 
-- `git`, and the `codex` and/or `claude` CLIs on your `PATH`.
+Linux only — developed and tested on Ubuntu. `install.sh` checks all of it.
+
+- **bash 4+** and **git 2.31+**. The 2.31 floor is not cosmetic: the launcher
+  uses `git rev-parse --path-format=absolute --git-common-dir` to find the
+  repository that owns a worktree. (`git worktree move` needs 2.17 and
+  `git branch --show-current` needs 2.22, so 2.31 covers everything.)
+- The `codex` and/or `claude` CLIs on your `PATH`, recent enough to accept
+  `--effort` / `--setting-sources` (Claude) and
+  `--dangerously-bypass-approvals-and-sandbox` (Codex). Only `--name` is probed
+  before use; the rest are passed unconditionally.
 - `python3` (optional): only used to read Codex's model catalogue; without it,
-  the pinned fallback model/effort is used.
+  the pinned fallback model/effort is used. Note that a machine which has never
+  run `codex` has no catalogue yet, so the first run uses that fallback.
+- `direnv` (optional): without it, worktree sessions simply run without the
+  project environment and say so.
+- git `user.name` / `user.email` set globally — the chronicler commits.
+- **Credentials are per-machine and ship with nothing here.** Run `claude` then
+  `/login`, and `codex login`, on each new machine.
 - These agents run with **no approval prompts and no sandbox**. That's the point
   — but only run them on tasks/repos you trust. In-place mode has **no isolation
   at all**: the agent edits your real working tree and can commit to your current
