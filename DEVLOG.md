@@ -12,6 +12,80 @@ Conventions:
 
 ---
 
+## 2026-10-12 — Stop Claude self-upgrading mid-session
+
+**What:** `bin/ai` now sets `DISABLE_AUTOUPDATER=1` and
+`CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=0` in the environment of the Claude
+session it starts, and `agent.d/lib/update.sh` sets the same two on its
+`claude --version` and `claude doctor` probes. Scoped to the child process; no
+settings file is touched. `AGENT_CLAUDE_AUTOUPDATE=1` restores the previous
+behaviour. Codex is untouched — it has no equivalent background updater.
+
+**Why:** `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE` was carried into this session
+as an undocumented follow-up, and verifying it turned up a real hazard rather
+than a documentation gap.
+
+- It is **not** a `claude update` setting. With it set, Claude re-checks on a
+  30-minute `setInterval` for the life of a session and runs
+  `brew upgrade --cask claude-code` in the background. Nothing ties it to a user
+  asking. This launcher exists to start long unattended runs, which is precisely
+  the window such a check lands in.
+- **Homebrew has no running-process protection.** The native installer keeps a
+  per-version lock and leaves a running version on disk; Homebrew knows nothing
+  about live Claude processes and replaces the payload. Anthropic's own docs note
+  a session reads its executable from disk *as it works*, so the failure mode is
+  a crashed session, not a deferred upgrade.
+- **It can race `ai update`.** Homebrew does not lock cask upgrades: `CaskLock`
+  exists in 7.0.9 but its only call site is `brew cleanup`. Formula operations
+  lock; casks do not. Two upgrades of one cask serialise on the *download* lock
+  (180 s) and then enter artifact replacement concurrently.
+
+`DISABLE_AUTOUPDATER` is the right switch because it is evaluated *before* the
+package-manager branch, so one variable covers the native and brew paths, and it
+suppresses only the background check — the explicit upgrade this feature performs
+still works. Anthropic's own remote runner sets it in child environments, which
+is first-party precedent for a launcher doing so.
+
+Default-off was chosen over opt-in because the cost is near zero and the failure
+is silent: a native install's background update only applies on the *next* start,
+so suppressing it within a session defers a download rather than losing an
+upgrade. The one real cost — plugin auto-updates share the switch — is documented
+rather than hidden.
+
+The probes are guarded for a narrower reason worth stating on its own: asking a
+question about an installation must not be what changes it. Claude mounts the
+updater as part of starting up, so an unguarded `claude doctor` during
+classification could trigger the very upgrade the run is still deciding whether
+to perform.
+
+**Also learned, and worth not re-deriving:** `"autoUpdates": false` in
+`~/.claude.json` is dead config on a native install. The native installer writes
+it together with `autoUpdatesProtectedForNative: true`, and the updater's own
+guard ignores the former when the latter is set — which is why `claude doctor`
+reports `Auto-updates: enabled` while the JSON says `false`. That contradiction
+is intended behaviour; do not read that key as a preference.
+
+**How verified:** `DISABLE_AUTOUPDATER=1 claude doctor` reports
+`Auto-updates: disabled (set by env: DISABLE_AUTOUPDATER)` against a baseline of
+`enabled`. A stub `claude` on `PATH` confirms the child receives
+`DISABLE_AUTOUPDATER=1` / `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=0` by default
+and neither with `AGENT_CLAUDE_AUTOUPDATE=1`. Suites green after the change:
+update 90, install 16, dependencies 25, codex-launch 20 (the last proving the
+claude-only guard leaves Codex launches alone). The report line is behind an
+explicit `if` rather than `[ ... ] && echo`, which under `set -e` would have
+aborted every Codex run at that line.
+
+**Follow-ups:** whether the background updater mounts in `-p` (print) mode is
+unverified — static reading suggests the interactive REPL only, and the env var
+is passed regardless. Whether
+`CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE` is honoured from the `env` block of
+`settings.json` as opposed to the process environment is also unverified, and
+moot for suppression since `DISABLE_AUTOUPDATER` covers the path either way.
+
+**Commits:** see below.
+
+---
+
 ## 2026-10-12 — Documentation restructure; the logbook becomes real
 
 **What:** `README.md` reorganised into an orientation page — install, upgrade,

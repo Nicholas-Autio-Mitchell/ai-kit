@@ -831,6 +831,32 @@ fallback shown above.
 > If your team requires signed history, re-sign before pushing (e.g.
 > `git rebase --exec 'git commit --amend -S --no-edit' <base>`).
 
+> **Claude's background auto-updater is OFF for the session the launcher
+> starts.** `DISABLE_AUTOUPDATER=1` and
+> `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=0` are set in the child's environment
+> only — your settings files are never touched, and explicit updates
+> (`ai update`, `claude update`) still work, because that switch stops only the
+> *background* check.
+>
+> The reason is specific to how this launcher is used. Claude re-checks for
+> updates every 30 minutes for the life of a session. On a **Homebrew**
+> install with `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1`, that check runs
+> `brew upgrade --cask claude-code` in the background. Sessions here are long
+> and unattended by design, so such a check is likely to land *during* a run
+> rather than between runs — and Homebrew, unlike the native installer, keeps no
+> per-version lock for running processes: it replaces the payload while a session
+> is still reading its executable from disk. It can also race `ai update` itself,
+> because Homebrew does not lock cask upgrades (`CaskLock` exists but is used
+> only by `brew cleanup`), so two upgrades of one cask serialise on the download
+> and then enter artifact replacement together.
+>
+> Little is lost. A native install's background update only takes effect on the
+> *next* start, so suppressing it inside one session merely defers the download
+> to the following launch. The one real side effect is that **plugin**
+> auto-updates share this switch and are skipped too. `AGENT_CLAUDE_AUTOUPDATE=1`
+> restores your own behaviour. Codex is unaffected — it has no equivalent
+> background updater.
+
 ## Environment overrides
 
 Defaults favor maximum effort and unattended work. The legacy `AGENT_WT_*`
@@ -851,6 +877,7 @@ names are still honored as fallbacks.
 | `AGENT_SUPPORT_DIR`             | `<dir-of-ai>/agent.d`, or `../agent.d` in the source clone              |
 | `AGENT_NO_AGENTS=1`             | skip the bundled team, its directive, and Codex feature enabling       |
 | `AGENT_NO_GPG_SIGN`             | `1` (default): commits unsigned, scoped to the run; `0` keeps signing    |
+| `AGENT_CLAUDE_AUTOUPDATE`       | `0` (default): Claude's background auto-updater off for the session it starts; `1` keeps your own behaviour. See below |
 
 `ai update` only — see *Updating the agent CLIs* above for the detail:
 

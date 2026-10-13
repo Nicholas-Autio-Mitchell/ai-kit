@@ -87,6 +87,18 @@ set -euo pipefail
 #                            passphrase. Set to 0 to keep your normal signing.
 #                            Scoped to this run via GIT_CONFIG_* env vars —
 #                            your repo's git config is never modified.)
+#   AGENT_CLAUDE_AUTOUPDATE (default 0 = Claude's BACKGROUND auto-updater is off
+#                            for the session this starts, via DISABLE_AUTOUPDATER
+#                            in the child's environment only. Claude re-checks
+#                            every 30 minutes for the life of a session, and on a
+#                            Homebrew install with
+#                            CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1 that runs
+#                            `brew upgrade --cask` — which can replace the binary
+#                            underneath the long unattended run this launcher
+#                            exists to start, and can race `<cmd> update`.
+#                            Explicit updates are unaffected. Set to 1 to keep
+#                            your own behaviour; note plugin auto-updates share
+#                            this switch.)
 #
 # direnv
 # ------
@@ -318,6 +330,12 @@ environment overrides (legacy AGENT_WT_* names still honored):
   AGENT_NO_GPG_SIGN             1 — commits unsigned, scoped to this run so the
                                 auto-commits never block on a passphrase prompt
                                 (0 keeps your normal signing)
+  AGENT_CLAUDE_AUTOUPDATE       0 — Claude's background auto-updater is off for
+                                the session this starts, so it cannot replace its
+                                own binary mid-run or race '$invoked_as update'.
+                                Scoped to the child's environment; your settings
+                                are untouched and explicit updates still work.
+                                1 keeps your own behaviour.
   AGENT_UPDATE_TIMEOUT          900 — seconds an 'update' upgrade may run before
                                 it is killed; 0 removes the clock. A Homebrew
                                 prefix that is not the default cannot use bottles
@@ -1403,6 +1421,42 @@ else
   gpg_sign_note="on (your git config)"
 fi
 
+# Claude's background auto-updater: OFF for the duration of the session we are
+# about to start, scoped to this run via the child's environment — the user's
+# settings files are never touched, and `ai update` (or a plain `claude update`)
+# still upgrades normally, because DISABLE_AUTOUPDATER stops only the BACKGROUND
+# check.
+#
+# The hazard is specific to how this launcher is used. Claude re-checks on a
+# 30-minute interval for the life of a session, and on a Homebrew-managed install
+# with CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1 that check runs
+# `brew upgrade --cask claude-code` in the background. Sessions here are
+# long-running and unattended by design, which makes that near-certain to land
+# mid-run rather than between runs. A native install is safe to swap under a live
+# session — it keeps a per-version lock and leaves a running version on disk — but
+# Homebrew knows nothing about running Claude processes and simply replaces the
+# payload, and a session reads its executable from disk AS IT WORKS. It also races
+# `ai update`: Homebrew does not lock cask upgrades (CaskLock exists but is only
+# used by cleanup), so two upgrades of the same cask serialise on the download and
+# then enter artifact replacement together.
+#
+# Little is given up. A native install's background update only takes effect on
+# the NEXT start, so suppressing it inside one session costs nothing but the
+# download, which happens on the following launch instead. The one real side
+# effect is that plugin auto-updates share this switch and are skipped too.
+# AGENT_CLAUDE_AUTOUPDATE=1 restores the default behaviour.
+claude_autoupdate="$(first_set AGENT_CLAUDE_AUTOUPDATE || printf '0')"
+if [ "$agent" = claude ] && [ "$claude_autoupdate" = "0" ]; then
+  export DISABLE_AUTOUPDATER=1
+  # Redundant while DISABLE_AUTOUPDATER is checked first, and deliberately kept:
+  # it is the switch that actually governs the package-manager path, it parses 0
+  # as false, and it survives any future reordering of those two guards.
+  export CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=0
+  autoupdate_note="off for this session (AGENT_CLAUDE_AUTOUPDATE=1 restores it)"
+else
+  autoupdate_note="your setting"
+fi
+
 # ---- Temporary-scaffold bookkeeping (in-place mode) ------------------------
 # In a worktree everything is throwaway. In place, we must leave the repository
 # exactly as we found it: track every file/dir we create, remove them on exit,
@@ -1555,6 +1609,11 @@ esac
 echo "team:          $agents_installed" >&2
 echo "direnv:        $direnv_note" >&2
 echo "commit signing: $gpg_sign_note" >&2
+# An `[ ... ] && echo` one-liner would be a `set -e` trap here: the list returns
+# the test's status, so a Codex run would abort at this line.
+if [ "$agent" = claude ]; then
+  echo "auto-update:   $autoupdate_note" >&2
+fi
 if [ -n "$prompt" ]; then
   echo "task:          runs your prompt immediately" >&2
 else

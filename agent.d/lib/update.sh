@@ -831,7 +831,9 @@ ai_update_force() {
 # binary, not the tool name, so an AI_KIT_*_BINARY override is the thing measured.
 ai_update_installed() {
   local out
-  out="$(ai_run_timeout 20 "$1" --version </dev/null 2>/dev/null || true)"
+  out="$(ai_run_timeout 20 env DISABLE_AUTOUPDATER=1 \
+           CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=0 \
+           "$1" --version </dev/null 2>/dev/null || true)"
   out="${out%%$'\n'*}"
   ai_update_semver "$out"
 }
@@ -868,7 +870,16 @@ ai_update_channel() {
     # unrecognised doctor must degrade to the installer's own default, not to an
     # aborted run.
     _ai_claude_channel=latest
-    out="$(ai_run_timeout 20 "$bin" doctor </dev/null 2>/dev/null || true)"
+    # DISABLE_AUTOUPDATER on every probe: asking a question about the installation
+    # must not be what CHANGES it. Claude mounts its background updater as part of
+    # starting up, so an unguarded `doctor` here could kick off the very upgrade
+    # this run is still deciding whether to perform — and on a Homebrew install
+    # that is a `brew upgrade --cask` racing the one we may be about to run
+    # ourselves. It suppresses only the background path; the explicit upgrade in
+    # ai_update_cmd is unaffected.
+    out="$(ai_run_timeout 20 env DISABLE_AUTOUPDATER=1 \
+             CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=0 \
+             "$bin" doctor </dev/null 2>/dev/null || true)"
     case "$(printf '%s\n' "$out" |
             LC_ALL=C sed -n 's/^[[:space:]]*Auto-update channel:[[:space:]]*//p' |
             head -1 || true)" in

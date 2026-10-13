@@ -409,6 +409,7 @@ time beyond the four questions.
 | `AGENT_DIRENV` | `1` (`0` disables direnv integration entirely) |
 | `AGENT_NO_AGENTS` | `0` (`1` skips the bundled team, its directive, and Codex feature enabling) |
 | `AGENT_NO_GPG_SIGN` | `1` — commits unsigned, scoped to the run, so auto-commits never block on a passphrase |
+| `AGENT_CLAUDE_AUTOUPDATE` | `0` — Claude's *background* auto-updater is off for the session, so it cannot replace its own binary mid-run or race `ai update`; `1` keeps your own behaviour |
 
 `ai update` only:
 
