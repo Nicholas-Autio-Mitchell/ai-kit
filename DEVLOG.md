@@ -12,6 +12,39 @@ Conventions:
 
 ---
 
+## 2026-10-13 — One concise README
+
+**What:** `README.md` is rewritten as the single, present-tense guide: install,
+usage, and what a run does (77 lines). `agent.d/README.md`, the long manual, is
+deleted; `ai --help` is the reference for environment overrides. `.gitignore`
+comments are trimmed.
+
+**Why:** The owner asked for one extremely concise README with no legacy or
+decision history; that history lives in this logbook. This also closes the
+README follow-up of the `ai update` removal entry: no README describes
+`ai update` or `AGENT_CLAUDE_AUTOUPDATE` any more.
+
+**How verified:** the critic cross-checked every claim against `bin/ai` and
+`install.sh`; links and paths were checked.
+
+**Final verification:** the test-engineer ran `agent.d/tests/install.sh`,
+`codex-launch.sh` and `direnv-worktree.sh` on the working tree these four
+commits record, each with a `bash` link to the target Bash first on `PATH`
+(`INSTALL_TEST_BASH` to match), both lanes concurrently:
+- `/bin/bash` 3.2.57: install 19/19, codex-launch 32/32, direnv-worktree 99/99, pass.
+- Homebrew bash 5.3.20: install 19/19, codex-launch 32/32, direnv-worktree 99/99, pass.
+- Job-notice regression (direnv-worktree sections 27 and 29, ~120 direnv probes
+  under `/bin/bash` 3.2): with the old `exit "$status"` (a temp copy) the suite
+  fails with 41 leaked notice lines; with the current code, 0 notices in 57
+  captures on both Bashes.
+- Suite time is ~110 s per Bash run alone, down from ~320 s for these three
+  (the 7-minute `update` suite and the dependencies suite are gone): fakes are
+  written once per run as `/bin/sh` scripts, the Python suites run in parallel
+  via `parallel_runner.py`, and the 20 s hanging-`.envrc` section runs in the
+  background.
+
+**Commits:** the `docs:` commit that carries this entry.
+
 ## 2026-10-13 — One command grammar; the team scaffold is temporary everywhere
 
 **What:** One grammar: `ai [wt] [claude|codex] [-b REF] [-n NAME] [--] [prompt...]`

@@ -1,17 +1,10 @@
-# Nothing this package produces belongs in git. install.sh writes only to the
-# prefix and bin dir you choose, and the test suite writes only to its scratch
-# root — so this list is purely defensive.
+# Nothing ai-kit produces belongs in git; these entries are defensive.
 
-# Scaffolding a session would drop here if an agent is ever run in this repo.
-# The launcher already hides and removes these, but belt and braces.
+# Session scaffolding, should an agent run in this repo (the launcher removes it).
 /.claude/agents/
 /.codex/agents/
 
-# /DEVLOG.md was listed here while the only DEVLOG.md this repo ever saw was a
-# session scaffold, which would otherwise have shown up as noise. The repo now
-# keeps a real logbook, so it is tracked. Nothing has to guard it: the launcher
-# copies the scaffold only when no DEVLOG.md exists, and removes it only while it
-# is still byte-identical to agent.d/DEVLOG.template.md (bin/ai:1423, bin/ai:1510).
+# DEVLOG.md is this repo's own logbook, so it is tracked.
 
 # Editor / OS noise
 *.swp
