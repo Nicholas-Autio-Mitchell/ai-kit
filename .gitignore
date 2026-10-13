@@ -1,0 +1,15 @@
+# Nothing this package produces belongs in git. install.sh writes only to the
+# prefix and bin dir you choose, and the test suite writes only to its scratch
+# root — so this list is purely defensive.
+
+# Scaffolding a session would drop here if an agent is ever run in this repo.
+# The launcher already hides and removes these, but belt and braces.
+/.claude/agents/
+/.codex/agents/
+/DEVLOG.md
+
+# Editor / OS noise
+*.swp
+*~
+.idea/
+.vscode/
