@@ -650,7 +650,11 @@ direnv_run() (
   watchdog_pid=$!
   status=0
   wait "$command_pid" 2>/dev/null || status=$?
-  exit "$status"
+  # `return`, not `exit`: inside $( ), Bash 3.2 implements `exit` by unwinding to
+  # the command substitution, which restores the caller's stderr before the EXIT
+  # trap runs, so the trap's "Killed: 9 ( sleep 20; ... )" job notice escaped a
+  # caller's 2>/dev/null and reached the terminal.
+  return "$status"
 )
 
 # direnv_ok <dir> — true when direnv can RUN a command for <dir>: nothing is in

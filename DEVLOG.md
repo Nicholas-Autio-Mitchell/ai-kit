@@ -12,6 +12,31 @@ Conventions:
 
 ---
 
+## 2026-10-13 — `direnv_run` ends with `return`, so Bash 3.2 cannot leak job notices
+
+**What:** `direnv_run()` in `bin/ai` ends with `return "$status"` instead of
+`exit "$status"`. Nothing else changes.
+
+**Why:** `direnv_allowed` calls `direnv_run` inside `$( ... 2>/dev/null )`.
+Bash 3.2 implements `exit` in a `( )` subshell by unwinding through the
+command substitution's cleanup, which restores the caller's saved stderr
+before the EXIT trap runs (bash-3.2.57 `evalstring.c:194-197` ->
+`subst.c:4713`). The trap then SIGKILLs the `sleep 20` watchdog, and bash
+announces `line N: <pid> Killed: 9 ( sleep 20; ... )` on the terminal during
+agent launches. `return` ends the subshell normally, so the caller's
+redirection still holds when the trap runs. Same root cause as the `ai update`
+notice in the entry below; this closes that entry's first follow-up.
+
+**How verified:** the function extracted and called the way `direnv_allowed`
+calls it, 20 calls per case. Bash 3.2: the notice appeared in 15/20 calls
+without a tty and 19/20 with a pty before the change, 0/20 after. Bash 5.3:
+0/20 in both cases. Exit statuses are unchanged: status 3 passes through, and
+a failure inside `$( )` still propagates. A suite regression check (sections
+27 and 29 of `direnv-worktree.sh`) lands with the `refactor(cli):` commit; its
+result is under **Final verification** in the README entry above.
+
+**Commits:** the `fix(direnv):` commit that carries this entry.
+
 ## 2026-10-13 — Remove `ai update` and the Claude auto-update override
 
 **What:** Removed `ai update` (`agent.d/lib/update.sh`, its 90-test offline
