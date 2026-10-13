@@ -17,6 +17,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # install.sh never installs direnv; direnv-worktree.sh needs 2.33+.
       # Ubuntu 24.04 packages direnv 2.32, before the required JSON status API.
       - name: Install current upstream direnv on Linux
         if: runner.os == 'Linux'
@@ -25,25 +26,39 @@ jobs:
           curl -fsSL https://direnv.net/install.sh -o "$RUNNER_TEMP/install-direnv.sh"
           bash "$RUNNER_TEMP/install-direnv.sh"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Install ai-kit and ensure direnv is available
+      - name: Install direnv and Homebrew Bash on macOS
+        if: runner.os == 'macOS'
         shell: /bin/bash {0}
-        run: ./install.sh -y --prefix "$RUNNER_TEMP/ai-kit" --bin-dir "$RUNNER_TEMP/ai-bin" --name ai-test --shortcuts
+        run: brew install direnv bash
+      - name: Install ai-kit
+        shell: /bin/bash {0}
+        run: ./install.sh -y --prefix "$RUNNER_TEMP/ai-kit" --bin-dir "$RUNNER_TEMP/ai-bin" --name ai-test
+      # The suites and the launcher start with `#!/usr/bin/env bash`, so a `bash`
+      # link first on PATH decides which Bash they all run under. A custom shell
+      # gets no -e, so each step runs every suite and fails if any of them did.
       - name: Test with the system Bash
         shell: /bin/bash {0}
-        env:
-          INSTALL_TEST_BASH: /bin/bash
-          DEPENDENCY_TEST_BASH: /bin/bash
         run: |
-          agent.d/tests/install.sh
-          agent.d/tests/dependencies.sh
-          agent.d/tests/codex-launch.sh
-          agent.d/tests/direnv-worktree.sh
-      - name: Test Homebrew Bash
+          mkdir -p "$RUNNER_TEMP/system-bash"
+          ln -sf /bin/bash "$RUNNER_TEMP/system-bash/bash"
+          export PATH="$RUNNER_TEMP/system-bash:$PATH" INSTALL_TEST_BASH=/bin/bash
+          bash -c 'echo "Bash $BASH_VERSION"'
+          failed=0
+          for suite in install codex-launch direnv-worktree; do
+            agent.d/tests/$suite.sh || { echo "::error::$suite failed"; failed=1; }
+          done
+          exit "$failed"
+      - name: Test with Homebrew Bash
         if: runner.os == 'macOS'
         shell: /bin/bash {0}
         run: |
-          brew install bash
-          export INSTALL_TEST_BASH="$(brew --prefix)/bin/bash"
-          export DEPENDENCY_TEST_BASH="$INSTALL_TEST_BASH"
-          agent.d/tests/install.sh
-          agent.d/tests/dependencies.sh
+          brew_bash="$(brew --prefix)/bin/bash"
+          mkdir -p "$RUNNER_TEMP/homebrew-bash"
+          ln -sf "$brew_bash" "$RUNNER_TEMP/homebrew-bash/bash"
+          export PATH="$RUNNER_TEMP/homebrew-bash:$PATH" INSTALL_TEST_BASH="$brew_bash"
+          bash -c 'echo "Bash $BASH_VERSION"'
+          failed=0
+          for suite in install codex-launch direnv-worktree; do
+            agent.d/tests/$suite.sh || { echo "::error::$suite failed"; failed=1; }
+          done
+          exit "$failed"

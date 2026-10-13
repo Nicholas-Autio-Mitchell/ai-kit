@@ -12,6 +12,48 @@ Conventions:
 
 ---
 
+## 2026-10-13 — Installer: one link, no direnv install, the caller's `PATH`
+
+**What:** `install.sh` installs one symlink, `<bin-dir>/<name>` -> `<prefix>/ai`;
+`--shortcuts` / `--no-shortcuts` and the `*-wt` wrapper links are gone. It never
+installs direnv (`agent.d/lib/dependencies.sh` and its suite
+`agent.d/tests/dependencies.{py,sh}` are deleted) and only reports whether
+`claude`, `codex` and `direnv` are present. `agent.d/lib/platform.sh`, which put
+Homebrew's `bin` first on `PATH`, is deleted, so ai-kit uses whichever `claude`,
+`codex`, `git` and `direnv` come first on the user's `PATH`. Hardening:
+- a non-empty `--prefix` that is not an ai-kit install is refused (uninstall
+  removes the prefix whole); an interrupted install whose prefix holds only
+  payload entries can be retried;
+- the bin dir must be writable before the prefix is touched; `:` is rejected in
+  `--name` and `--bin-dir`; `chmod` touches only the payload;
+- stale manifest links are compared by resolved location, so a bin dir reached
+  through a symlink no longer deletes the new link; old `agent-wt` /
+  `claude-wt` / `codex-wt` payload files are removed on upgrade.
+
+New `agent.d/tests/parallel_runner.py` runs a Python suite across worker
+processes (`AI_TEST_JOBS=1` for one; `-k` runs in-process); `install.py` uses it.
+CI drops `--shortcuts` and the dependencies suite, installs direnv on macOS
+(the installer no longer does), runs each suite under the target Bash via a
+`bash` link first on `PATH`, and fails a step if any of its suites failed (the
+custom `shell: /bin/bash {0}` has no `-e`, so before only the last suite counted).
+
+**Why:** The owner's scope: users bring, update and log in to their own CLIs
+(and direnv); ai-kit only runs the command they give it. The hardening answers
+review and audit findings: `chmod`/`rm` reaching a shared directory given as the
+prefix, a `:` that `PATH` would split, and a failed install that could not be
+retried.
+
+**How verified:** syntax under `/bin/bash` 3.2.57 and Homebrew bash 5.3.20.
+Sandbox scenarios on both Bashes: an unwritable bin dir fails before the prefix
+exists; a retry after an interrupted install succeeds; a foreign prefix is
+refused with its files intact; an upgrade through a symlinked bin dir keeps its
+link; an upgrade over an old `--shortcuts` install removes the owned `*-wt`
+links and leaves a foreign one; uninstall leaves nothing. The suites ran once,
+on the tree after the README commit, not on this commit alone: install 19/19 on
+both Bashes (see **Final verification** in the README entry above).
+
+**Commits:** the `refactor(install):` commit that carries this entry.
+
 ## 2026-10-13 — `direnv_run` ends with `return`, so Bash 3.2 cannot leak job notices
 
 **What:** `direnv_run()` in `bin/ai` ends with `return "$status"` instead of

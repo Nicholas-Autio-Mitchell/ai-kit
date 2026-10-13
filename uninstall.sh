@@ -8,7 +8,6 @@ set -euo pipefail
 # symlink pointing into the prefix, so a name you have since taken over with
 # your own tool is reported and left alone. Nothing outside the prefix and the
 # recorded links is ever touched.
-# direnv is a shared system dependency and is intentionally left installed.
 #
 # usage:
 #   ./uninstall.sh                 find the installation and remove it
@@ -26,8 +25,6 @@ while [ -h "$src" ]; do
 done
 HERE="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
 . "$HERE/agent.d/lib/paths.sh"
-. "$HERE/agent.d/lib/platform.sh"
-ai_prefer_homebrew
 
 if [ -t 2 ]; then
   B=$'\033[1m'; DIM=$'\033[2m'; GRN=$'\033[32m'; YLW=$'\033[33m'; RED=$'\033[31m'; N=$'\033[0m'
@@ -140,6 +137,5 @@ ok "removed $PREFIX"
 say ""
 say "  Untouched, because they are yours and not ours:"
 say "    ~/.claude/  ~/.codex/   (agent settings and credentials)"
-say "    direnv and its configuration (shared system dependency)"
 say "    any DEVLOG.md or .claude/agents/ committed in your own repositories"
 say ""

@@ -1,40 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install.sh — install the ai-kit launcher and its subagent team on Linux/macOS.
+# install.sh — install the ai-kit launcher and its subagent team (Linux/macOS).
 #
-# The pattern: a self-contained PAYLOAD directory plus OWNED SYMLINKS.
+# Lays down a self-contained payload and one symlink to it:
 #
-#   <prefix>/                      everything the tool needs, in one versioned dir
-#   <bin-dir>/<cmd>  -> <prefix>/ai
+#   <prefix>/                      ai, agent.d/, uninstall.sh, VERSION, manifest
+#   <bin-dir>/<name>  -> <prefix>/ai
 #
-# Only symlinks ever land in a directory on your PATH, and only ones this script
-# recorded in <prefix>/manifest. It refuses to replace anything it does not own,
-# so it cannot clobber another tool's binary, and uninstall.sh removes exactly
-# what was created and nothing else.
+# The link is recorded in <prefix>/manifest. Nothing that is not already an
+# ai-kit link is ever replaced. Re-running upgrades in place and removes recorded
+# links it no longer creates; uninstall.sh removes exactly what is recorded.
 #
-# The launcher resolves its own location through symlinks and looks for agent.d/
-# beside itself, so the payload works from any prefix and the symlink can be
-# named anything you like. That is why the command name is a question rather
-# than a constant: if `ai` is taken on your machine, pick another name and
-# nothing else changes.
-#
-# usage:
-#   ./install.sh                          interactive (recommended)
-#   ./install.sh -y                       non-interactive, all defaults
-#   ./install.sh --name aid --shortcuts -y
-#   ./install.sh --uninstall
-#
-# options:
-#   --prefix DIR      payload location   (default: $XDG_DATA_HOME/ai-kit)
-#   --bin-dir DIR     where the command symlink goes (default: ~/.local/bin)
-#   --name NAME       command name       (default: ai)
-#   --shortcuts       also install <cmd>-wt, claude-wt, codex-wt
-#   --no-shortcuts    do not (the default)
-#   -y, --yes         answer nothing, take the defaults
-#   --uninstall       hand off to uninstall.sh
-#   -h, --help        this text
-#
+# Options: ./install.sh --help (usage() below).
 # Supports Linux and macOS, including Apple's bundled Bash 3.2 and BSD utilities.
 
 # ---- Where this script lives (payload source) ------------------------------
@@ -46,9 +24,6 @@ while [ -h "$src" ]; do
 done
 REPO="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
 . "$REPO/agent.d/lib/paths.sh"
-. "$REPO/agent.d/lib/platform.sh"
-. "$REPO/agent.d/lib/dependencies.sh"
-ai_prefer_homebrew
 
 VERSION="$(cat "$REPO/VERSION" 2>/dev/null || echo unknown)"
 
@@ -62,27 +37,21 @@ usage() {
   cat <<EOF
 install.sh — install the ai-kit launcher and its subagent team (Linux/macOS).
 
-usage:
-  ./install.sh                       interactive (recommended)
-  ./install.sh -y                    non-interactive, all defaults
-  ./install.sh --name aid --shortcuts -y
-  ./install.sh --uninstall
+usage: ./install.sh [options]
+
+Asks for each setting not given as an option, unless -y is set or stdin is not
+a terminal. Re-running upgrades in place.
 
 options:
-  --prefix DIR      payload location   (default: \${XDG_DATA_HOME:-~/.local/share}/ai-kit)
-  --bin-dir DIR     where the command symlink goes (default: ~/.local/bin)
-  --name NAME       command name       (default: ai)
-  --shortcuts       also install <cmd>-wt, claude-wt, codex-wt
-  --no-shortcuts    do not (the default)
-  -y, --yes         answer nothing, take the defaults
-  --uninstall       hand off to uninstall.sh
-  -h, --help        this text
+  --prefix DIR    payload directory (default: \${XDG_DATA_HOME:-~/.local/share}/ai-kit)
+  --bin-dir DIR   directory on your PATH for the command symlink (default: ~/.local/bin)
+  --name NAME     command name (default: ai)
+  -y, --yes       ask nothing; use the default for each setting not given
+  --uninstall     run uninstall.sh with the options that follow (--prefix DIR, -y)
+  -h, --help      show this help
 
-Installs a self-contained payload under --prefix and a symlink to it in
---bin-dir; uninstall.sh removes the files recorded in <prefix>/manifest.
-Missing direnv is installed with Homebrew on macOS or the system package
-manager on Linux. Homebrew itself is never
-installed automatically. Uninstall leaves direnv installed.
+ai-kit runs the claude (default) or codex on your PATH; install, update and log in to
+at least one yourself. direnv is used if present and never installed.
 EOF
 }
 
@@ -97,7 +66,7 @@ DEFAULT_PREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/ai-kit"
 DEFAULT_BIN_DIR="$HOME/.local/bin"
 DEFAULT_NAME="ai"
 
-PREFIX=""; BIN_DIR=""; CMD=""; SHORTCUTS=""; ASSUME_YES=0
+PREFIX=""; BIN_DIR=""; CMD=""; ASSUME_YES=0
 
 # ---- Arguments -------------------------------------------------------------
 while [ "$#" -gt 0 ]; do
@@ -105,8 +74,6 @@ while [ "$#" -gt 0 ]; do
     --prefix)      [ "$#" -ge 2 ] || die "--prefix needs a directory";  PREFIX="$2";  shift 2 ;;
     --bin-dir)     [ "$#" -ge 2 ] || die "--bin-dir needs a directory"; BIN_DIR="$2"; shift 2 ;;
     --name)        [ "$#" -ge 2 ] || die "--name needs a command name"; CMD="$2";     shift 2 ;;
-    --shortcuts)   SHORTCUTS=1; shift ;;
-    --no-shortcuts) SHORTCUTS=0; shift ;;
     -y|--yes)      ASSUME_YES=1; shift ;;
     --uninstall)   shift; exec "$REPO/uninstall.sh" "$@" ;;
     -h|--help)     usage; exit 0 ;;
@@ -126,14 +93,6 @@ ask() {  # ask <question> <default>
   printf '  %s %s[%s]%s ' "$q" "$DIM" "$default" "$N" >&2
   IFS= read -r reply || reply=""
   printf '%s' "${reply:-$default}"
-}
-ask_yn() {  # ask_yn <question> <y|n default> -> 0 = yes
-  local q="$1" default="$2" reply=""
-  if [ "$interactive" -eq 0 ]; then [ "$default" = y ]; return; fi
-  case "$default" in y) local hint="Y/n" ;; *) local hint="y/N" ;; esac
-  printf '  %s %s[%s]%s ' "$q" "$DIM" "$hint" "$N" >&2
-  IFS= read -r reply || reply=""
-  case "${reply:-$default}" in [yY]*) return 0 ;; *) return 1 ;; esac
 }
 
 # abspath <path> — expand a leading ~ and make it absolute WITHOUT requiring the
@@ -179,16 +138,8 @@ command -v claude >/dev/null 2>&1 && have_claude=1
 command -v codex  >/dev/null 2>&1 && have_codex=1
 if [ "$have_claude" -eq 1 ]; then ok "claude  $(claude --version 2>/dev/null | head -1)"; fi
 if [ "$have_codex"  -eq 1 ]; then ok "codex   $(codex  --version 2>/dev/null | head -1)"; fi
-if [ "$have_claude" -eq 0 ] && [ "$have_codex" -eq 0 ]; then
-  warn "neither 'claude' nor 'codex' is on your PATH — install at least one:"
-  say  "      Claude Code: curl -fsSL https://claude.ai/install.sh | bash"
-  say  "      Codex:       npm i -g @openai/codex   (or: brew install --cask codex)"
-  say  "    Installing anyway; the launcher will work once a CLI is present."
-elif [ "$have_claude" -eq 0 ]; then
-  warn "'claude' not found — the default agent will not run. Use '<cmd> codex ...' or install Claude Code."
-elif [ "$have_codex" -eq 0 ]; then
-  warn "'codex' not found — '<cmd> codex ...' will not run until it is installed."
-fi
+agents_note="ai-kit runs the 'claude' (default) or 'codex' on your PATH; install, update and log in to them yourself."
+if [ "$have_claude" -eq 1 ] || [ "$have_codex" -eq 1 ]; then say "  $agents_note"; else warn "$agents_note"; fi
 
 if command -v python3 >/dev/null 2>&1; then
   ok "python3 $(python3 --version 2>&1 | awk '{print $2}')  (Codex supported-effort detection)"
@@ -196,10 +147,17 @@ else
   warn "python3 not found — Codex uses known effort defaults (GPT-6 Astra: ultra) instead of its catalogue."
 fi
 
+# Optional, and never installed. The launcher reads `direnv status --json`
+# (2.33+); an older direnv cannot load the project .envrc for the agent.
 if command -v direnv >/dev/null 2>&1; then
-  say "  direnv found: $(command -v direnv) (verified before installing the payload)"
+  direnv_v="$(direnv version 2>/dev/null || true)"
+  if direnv version 2.33.0 >/dev/null 2>&1; then
+    ok "direnv $direnv_v  (loads the project .envrc for the agent)"
+  else
+    warn "direnv ${direnv_v:-(no version)} is older than 2.33; ai-kit will not load .envrc with it."
+  fi
 else
-  say "  direnv not found — it will be installed after destination checks."
+  say "  direnv not found (optional; used to load the project .envrc for the agent)"
 fi
 
 if git config --get user.email >/dev/null 2>&1 && git config --get user.name >/dev/null 2>&1; then
@@ -211,7 +169,7 @@ else
 fi
 
 # ---- Questions -------------------------------------------------------------
-# Four, and each one changes the install. Everything else is an environment
+# Three, and each one changes the install. Everything else is an environment
 # variable at run time (see README) and does not belong in an installer.
 if [ "$interactive" -eq 1 ]; then
   head_ "Setup"
@@ -224,6 +182,9 @@ PREFIX="$(abspath "$PREFIX")"
 
 [ -n "$BIN_DIR" ] || BIN_DIR="$(ask "Directory on your PATH for the command?" "$DEFAULT_BIN_DIR")"
 BIN_DIR="$(abspath "$BIN_DIR")"
+case "$BIN_DIR" in
+  *:*) die "the command directory cannot contain ':' (PATH could never hold it): '$BIN_DIR'" ;;
+esac
 
 # Command name, with collision detection. This is the question that keeps the
 # package from stepping on another tool: 'ai' is a short, popular name.
@@ -238,22 +199,11 @@ if [ -z "$CMD" ]; then
   CMD="$(ask "Command name?" "$suggested")"
 fi
 case "$CMD" in
-  ""|*/*|*[[:space:]]*) die "invalid command name: '$CMD'" ;;
+  ""|*/*|*:*|*[[:space:]]*) die "invalid command name: '$CMD'" ;;
 esac
-
-if [ -z "$SHORTCUTS" ]; then
-  if ask_yn "Also install worktree shortcuts ($CMD-wt, claude-wt, codex-wt)?" n; then
-    SHORTCUTS=1
-  else
-    SHORTCUTS=0
-  fi
-fi
 
 # ---- Work out the links, and refuse to touch anything we do not own --------
 links=("$BIN_DIR/$CMD:ai")
-if [ "$SHORTCUTS" -eq 1 ]; then
-  links+=("$BIN_DIR/$CMD-wt:agent-wt" "$BIN_DIR/claude-wt:claude-wt" "$BIN_DIR/codex-wt:codex-wt")
-fi
 
 # owned <path> — true when <path> is a symlink already pointing into our prefix.
 # That is the whole ownership test: we replace our own links on upgrade and
@@ -291,28 +241,39 @@ head_ "Installing"
 case "$PREFIX" in
   "/"|"$HOME"|"") die "refusing to use '$PREFIX' as the payload directory" ;;
 esac
+# uninstall.sh removes the prefix whole, so it must be ai-kit's alone: an
+# existing install (or the payload of an interrupted one), or a new or empty
+# directory.
+if [ -d "$PREFIX" ] && ! grep -qs '^# ai-kit install manifest' "$PREFIX/manifest"; then
+  for entry in "$PREFIX"/* "$PREFIX"/.[!.]* "$PREFIX"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    case "${entry##*/}" in
+      agent.d|ai|uninstall.sh|VERSION|manifest) ;;
+      *) die "'$PREFIX' is not empty and is not an ai-kit install; choose a new or empty directory." ;;
+    esac
+  done
+fi
+mkdir -p -- "$BIN_DIR" 2>/dev/null && [ -w "$BIN_DIR" ] \
+  || die "cannot write to '$BIN_DIR'; choose a directory you own with --bin-dir."
 
-ai_install_direnv
-
-# Upgrade in place: clear only the payload we lay down, never the whole prefix,
-# so a manifest or anything else the user parked there survives.
+# Upgrade in place: replace only the payload we lay down, never the whole prefix.
 rm -rf -- "$PREFIX/agent.d"
-rm -f  -- "$PREFIX/ai" "$PREFIX/agent-wt" "$PREFIX/claude-wt" "$PREFIX/codex-wt"
+rm -f  -- "$PREFIX/ai" "$PREFIX/agent-wt" "$PREFIX/claude-wt" "$PREFIX/codex-wt"  # older launchers
 mkdir -p -- "$PREFIX"
 
 cp -R -- "$REPO/agent.d" "$PREFIX/agent.d"
-for f in ai agent-wt claude-wt codex-wt; do
-  cp -- "$REPO/bin/$f" "$PREFIX/$f"
-done
+cp -- "$REPO/bin/ai" "$PREFIX/ai"
 cp -- "$REPO/uninstall.sh" "$PREFIX/uninstall.sh"
 cp -- "$REPO/VERSION" "$PREFIX/VERSION"
 
-# Deterministic modes: a clone inherits the cloner's umask, and a payload that
-# is not readable by the launcher is a confusing failure.
-find "$PREFIX" -type d -exec chmod 755 {} +
-find "$PREFIX" -type f -exec chmod 644 {} +
-chmod 755 "$PREFIX"/ai "$PREFIX"/agent-wt "$PREFIX"/claude-wt "$PREFIX"/codex-wt \
-          "$PREFIX"/uninstall.sh "$PREFIX"/agent.d/tests/*.sh
+# Deterministic modes on the payload only: a clone inherits the cloner's umask,
+# and a payload that is not readable by the launcher is a confusing failure.
+chmod 755 "$PREFIX"
+find "$PREFIX/agent.d" -type d -exec chmod 755 {} +
+find "$PREFIX/agent.d" -type f -exec chmod 644 {} +
+find "$PREFIX/agent.d" -type f -name '*.sh' -exec chmod 755 {} +
+chmod 644 "$PREFIX/VERSION"
+chmod 755 "$PREFIX/ai" "$PREFIX/uninstall.sh"
 ok "payload -> $PREFIX"
 
 mkdir -p -- "$BIN_DIR"
@@ -324,12 +285,19 @@ for spec in "${links[@]}"; do
   ok "$path -> ${target#"$PREFIX"/}"
 done
 
-# Drop links from a previous install that this run did not recreate (e.g. the
-# command was renamed, or shortcuts were turned off). Only ever our own.
+# Drop links a previous install recorded that this run did not recreate (e.g. a
+# renamed command, or extra links an older version made). Only ever our own.
+same_entry() {  # same_entry A B — true when A and B name the same directory entry
+  [ "$1" = "$2" ] && return 0
+  local da db
+  da="$(cd -P -- "$(dirname -- "$1")" 2>/dev/null && pwd -P)" || return 1
+  db="$(cd -P -- "$(dirname -- "$2")" 2>/dev/null && pwd -P)" || return 1
+  [ "$da/$(basename -- "$1")" = "$db/$(basename -- "$2")" ]
+}
 if [ -f "$PREFIX/manifest" ]; then
   while IFS= read -r old; do
     keep=0
-    for c in "${created[@]}"; do [ "$c" = "$old" ] && keep=1 && break; done
+    for c in "${created[@]}"; do same_entry "$c" "$old" && keep=1 && break; done
     if [ "$keep" -eq 0 ] && owned "$old"; then
       rm -f -- "$old"
       ok "removed stale link $old"
@@ -379,18 +347,11 @@ if [ "$have_claude" -eq 1 ]; then
 fi
 
 say ""
-say "  Sign in to the agents you use (credentials are per-machine; none ship with this package):"
-[ "$have_claude" -eq 1 ] && say "      claude   then /login"
-[ "$have_codex"  -eq 1 ] && say "      codex login"
-say ""
 say "  Try it:"
 say "      $CMD --help"
 say "      $CMD \"Fix the failing test in tests/test_login.py\"     # in place, current branch"
 say "      $CMD wt \"Risky refactor\"                               # isolated worktree"
-say "      $CMD wt codex \"Fix the failing test\"                  # worktree, GPT-6 Astra, ultra"
+say "      $CMD wt codex \"Fix the failing test\"                   # worktree, Codex"
 say ""
-say "  Manual:    $PREFIX/agent.d/README.md"
-say "  direnv:    project environments load automatically; review .envrc, then run 'direnv allow .' once."
-say "             Shell hooks are optional for ai-kit; see the manual for bash/zsh setup."
 say "  Uninstall: $PREFIX/uninstall.sh"
 say ""
