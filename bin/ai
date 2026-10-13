@@ -879,6 +879,7 @@ scaffold_untracked() {
 }
 
 cleanup_scaffold() {
+  trap '' INT TERM HUP   # a second Ctrl-C must not cut the cleanup short
   local i
   for (( i=0; i<${#created_files[@]}; i++ )); do
     if [ -f "${created_files[i]}" ] && scaffold_untracked "${created_files[i]}" \
@@ -917,9 +918,11 @@ install_file() {
 
 # Exit on any signal before the agent starts; EXIT removes the scaffold.
 trap cleanup_scaffold EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+# Once exiting, further signals are ignored: a pending one would otherwise run
+# its `exit` inside the EXIT trap and cut the cleanup short.
+trap 'trap "" INT TERM HUP; exit 130' INT
+trap 'trap "" INT TERM HUP; exit 143' TERM
+trap 'trap "" INT TERM HUP; exit 129' HUP
 
 # ---- Install the bundled subagent team -------------------------------------
 # Claude reads .claude/agents/*.md; Codex reads .codex/agents/*.toml (and the
@@ -1297,6 +1300,7 @@ $guardrails"
       claude_help=""
       probe_rc=0
       claude_help="$(${direnv_launch[@]+"${direnv_launch[@]}"} claude --help 2>/dev/null)" || probe_rc=$?
+      [ "$probe_rc" -ne 130 ] || { trap '' INT TERM HUP; exit 130; }   # interrupted: do not launch
       if [ "$probe_rc" -eq 127 ]; then
         echo "note: 'claude' was not found on PATH — the launch below will say so." >&2
       elif printf '%s' "$claude_help" | grep -qE -- '(^|[[:space:],])--name([[:space:],=]|$)'; then

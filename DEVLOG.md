@@ -12,6 +12,30 @@ Conventions:
 
 ---
 
+## 2026-10-13 — A Ctrl-C can no longer cut the scaffold cleanup short
+
+**What:** The INT/TERM/HUP traps in `bin/ai` now ignore further signals before
+they `exit` (`trap 'trap "" INT TERM HUP; exit 130' INT`, likewise 143 and 129);
+`cleanup_scaffold` starts with `trap '' INT TERM HUP`; and a `claude --help`
+probe interrupted inside its `$( )` (exit 130) aborts the launch the same way.
+
+**Why:** With the traps as committed in c9e850d, a SIGINT could still be
+pending when the shell began exiting. Bash runs pending traps while parsing the
+EXIT trap, so the INT trap's own `exit` ran inside the EXIT trap and ended the
+shell before cleanup, leaving `.claude/` behind after a Ctrl-C before launch
+(5 of 24 runs on Bash 5.3; 0 of 24 on 3.2). Closes the follow-up recorded in
+the CLI entry below.
+
+**How verified:** the two interrupt tests (before launch: exit 130, no launch,
+no scaffold; during the run: the launcher survives, prints the recipe and
+propagates the agent's status 42/130) passed 30/30 on Bash 5.3 and 15/15 on
+3.2; an intermediate variant without the "ignore before exit" step still failed
+1 of 12. Full suites after the change, both Bashes concurrently in 105 s wall:
+install 19/19, codex-launch 32/32, direnv-worktree 99/99 on `/bin/bash` 3.2.57
+and Homebrew bash 5.3.20.
+
+**Commits:** the `fix(cli):` commit that carries this entry.
+
 ## 2026-10-13 — One concise README
 
 **What:** `README.md` is rewritten as the single, present-tense guide: install,
@@ -88,7 +112,7 @@ on the final tree: codex-launch 32/32 and direnv-worktree 99/99 on both Bashes.
 
 **Follow-ups:**
 - On Bash 5.3 a second Ctrl-C can interrupt `cleanup_scaffold` (5 of 24
-  tries). Not fixed here; a separate commit will address it.
+  tries). Fixed by the `fix(cli):` Ctrl-C commit; see that entry above.
 
 **Commits:** the `refactor(cli):` commit that carries this entry.
 
