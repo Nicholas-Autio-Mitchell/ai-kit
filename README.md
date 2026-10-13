@@ -4,15 +4,27 @@ Run **Claude Code** or **OpenAI Codex** in full-auto mode with a bundled team of
 seven specialist subagents — either **in place** on your current branch, or
 inside a throwaway **git worktree**.
 
+Launch command:
 ```bash
+usage:
+  ai [wt] [claude|codex] [options] [--] [prompt...]
+  ai worktrees [--fix]
+```
+
+EXamples:
+```bash
+ai                                                    # in place, into session waiting for prompt
+ai wt                                                 # new git worktree
 ai          "Add a rate limiter to the API gateway"   # in place, current branch
 ai wt       "Refactor the scheduler to use asyncio"   # isolated worktree + branch
 ai    codex "Fix the failing auth test"               # same, with Codex
 ai worktrees                                          # audit this repo's worktrees
 ```
 
-Newest model, maximum reasoning effort, no approval prompts, and a
+All of these will use the newest model, maximum reasoning effort, no approval prompts, and a
 logbook/commit discipline that leaves a clean git history behind.
+
+Use `ai --help` for full list of options.
 
 ---
 
