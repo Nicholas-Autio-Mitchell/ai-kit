@@ -1,0 +1,1569 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ai — run an AI coding agent (Codex or Claude) in full-auto mode with a
+# bundled team of specialist subagents, either IN PLACE on your current branch
+# or inside a throwaway git worktree.
+#
+#   ai          "Do the task"     # in place, on the current branch (Claude)
+#   ai wt       "Do the task"     # isolated worktree + branch (Claude)
+#   ai    codex "Do the task"     # in place, with Codex instead
+#   ai wt codex "Do the task"     # isolated worktree + branch, with Codex
+#
+# Named "ai" rather than "agent" on purpose: the cursor-agent installer owns
+# ~/.local/bin/agent and recreates it on every self-update, which would silently
+# overwrite this script.
+#
+# Both agents get the same treatment in spirit: newest model, maximum reasoning
+# effort, no approval prompts, and a documentation/logbook discipline that
+# commits a clean git history.
+#
+#   Codex   -> newest model from Codex's own catalogue (~/.codex/models_cache.json,
+#              currently gpt-5.6-sol) at that model's highest reasoning effort
+#              (currently "ultra"), fast service tier,
+#              --dangerously-bypass-approvals-and-sandbox
+#   Claude  -> the "opus" alias, i.e. whatever the latest Opus model is
+#              (currently claude-opus-5), --effort max ("ultracode"
+#              orchestration), and the full autorun stack:
+#              --allow-dangerously-skip-permissions --dangerously-skip-permissions
+#              --permission-mode dontAsk
+#
+# Both defaults track the newest model automatically: Claude via its own
+# latest-model alias, Codex by reading the catalogue the CLI itself maintains.
+# Nothing here is version-pinned, so nothing here goes stale.
+#
+# Usage:
+#   ai [wt] [claude|codex] [options] [--] [prompt...]
+#
+# The agent name is optional and defaults to claude.
+#
+# Convenience wrappers (worktree mode, same options):
+#   agent-wt  "..."  ==  ai wt "..."
+#   codex-wt  "..."  ==  ai wt codex  "..."
+#   claude-wt "..."  ==  ai wt claude "..."
+#
+# Environment overrides (rarely needed; defaults are the "best" config).
+# The legacy AGENT_WT_* names are still honored as fallbacks.
+#   AGENT_CLAUDE_MODEL      (default: opus — alias for the latest Opus model.
+#                            Set to claude-opus-5[1m] for the 1M-token context,
+#                            or to sonnet / haiku for a cheaper run.)
+#   AGENT_CLAUDE_EFFORT     (default: max; set to xhigh if max overthinks, or
+#                            empty to inherit effortLevel from your settings.json)
+#   AGENT_CLAUDE_PERMISSION_MODE
+#                           (default: dontAsk — the fallback autorun mode. Claude
+#                            prefers bypassPermissions from
+#                            --dangerously-skip-permissions, but that one mode can
+#                            be vetoed by org policy / settings / an unaccepted
+#                            disclaimer, in which case the session silently drops
+#                            to "manual". --permission-mode is NOT subject to that
+#                            veto, so it keeps the session unattended. Valid:
+#                            acceptEdits, auto, bypassPermissions, dontAsk, plan,
+#                            manual. Empty = omit the flag.)
+#   AGENT_CLAUDE_SETTING_SOURCES
+#                           (default: user,project,local — which settings.json
+#                            scopes Claude loads; "user" includes
+#                            ~/.claude/settings.json. Empty = Claude's default.)
+#   AGENT_CODEX_MODEL       (default: newest listed model in Codex's model
+#                            catalogue, falling back to gpt-5.6-sol)
+#   AGENT_CODEX_EFFORT      (default: the highest effort that model supports,
+#                            falling back to ultra)
+#   AGENT_CODEX_TIER        (default: fast)
+#   AGENT_CODEX_SEARCH      (default: 1 = enable live web search via --search;
+#                            set to 0 to disable)
+#   AGENT_WORKTREE_DIR      (worktree mode; default:
+#                            <main-repo-parent>/<main-repo>.worktrees — always
+#                            anchored to the MAIN worktree, so running this from
+#                            inside a worktree no longer nests another
+#                            .worktrees/ directory underneath it)
+#                           (legacy AGENT_WT_WORKTREE_DIR / CODEX_WORKTREE_DIR honored)
+#   AGENT_DIRENV            (default: 1 = integrate with direnv when it is
+#                            installed. See "direnv" below. 0 disables all of it.)
+#   AGENT_SUPPORT_DIR       (default: <dir-of-this-script>/agent.d)
+#   AGENT_NO_AGENTS=1       (skip installing the bundled subagent team)
+#   AGENT_NO_GPG_SIGN       (default 1 = commits are NOT signed, so the
+#                            chronicler's auto-commits never block on a GPG
+#                            passphrase. Set to 0 to keep your normal signing.
+#                            Scoped to this run via GIT_CONFIG_* env vars —
+#                            your repo's git config is never modified.)
+#
+# direnv
+# ------
+# A worktree is only useful if it resolves to the SAME project environment as the
+# repository it was cut from. When the main worktree has an .envrc, every launch:
+#   1. symlinks that .envrc into the new worktree (so direnv finds one there),
+#   2. runs `direnv allow` on it, and
+#   3. launches the agent through `direnv exec`, so the AGENT process inherits
+#      the project's PATH/VIRTUAL_ENV — not just your interactive shells.
+#
+# Step 2 is needed per worktree because direnv keys its trust on
+# sha256(path + "\n" + contents): every worktree path needs its own blessing, and
+# editing the shared .envrc invalidates all of them at once. That is why this runs
+# on EVERY launch rather than only at creation — it self-heals.
+#
+# Trust is PROPAGATED, never created. A worktree's .envrc is only allowed when it
+# is a symlink to, or byte-identical with, an .envrc the main worktree has already
+# allowed. In place, `direnv allow` is never called at all — an unreviewed .envrc
+# is reported, not executed. Step 3 is skipped (with a reason) whenever direnv
+# cannot load the directory cleanly, so a blocked or broken .envrc downgrades to a
+# plain launch instead of failing to start the agent.
+#
+# Scope of that claim, precisely: it is about the .envrc's BYTES. Those bytes then
+# run in a directory whose contents come from <base>, and .envrc idioms are
+# directory-relative — `dotenv` reads the branch's .env, `PATH_add bin` puts the
+# branch's bin/ ahead of yours, `use flake` / `layout poetry` execute branch
+# content outright. So a worktree cut from a ref you do not trust can still
+# influence the environment through a trusted .envrc. This is inherent to direnv
+# plus worktrees, not specific to `ai` — but if you are reviewing someone else's
+# code (`ai wt --base origin/pr-1234 ...`), run it with AGENT_DIRENV=0.
+#
+# `ai worktrees` audits and repairs all of this for worktrees that already exist.
+
+# ---- How we were invoked (captured before symlink resolution) --------------
+# Anything named *-wt defaults to worktree mode, so the old wrappers keep their
+# behavior and `ln -s ai foo-wt` does the obvious thing.
+invoked_as="$(basename -- "${BASH_SOURCE[0]}")"
+case "$invoked_as" in
+  *-wt) use_worktree=1 ;;
+  *)    use_worktree=0 ;;
+esac
+
+# usage [exit-code] — a one-screen hint on error (stderr), the full manual on
+# explicit --help (stdout, so it pipes into less/grep).
+usage() {
+  local code="${1:-2}"
+
+  if [ "$code" -ne 0 ]; then
+    cat >&2 <<EOF
+usage: $invoked_as [wt] [claude|codex] [options] [--] [prompt...]
+       $invoked_as worktrees [--fix]
+
+  $invoked_as "Fix the failing auth test"     # in place, current branch, Claude
+  $invoked_as wt codex "Risky refactor"       # isolated worktree + branch, Codex
+  $invoked_as worktrees                       # audit this repo's worktrees + direnv
+
+Run '$invoked_as --help' for modes, options, examples, and environment overrides.
+EOF
+    exit "$code"
+  fi
+
+  cat <<EOF
+$invoked_as — run an AI coding agent (Codex or Claude) in full-auto mode: newest
+model, maximum reasoning effort, no approval prompts, a bundled team of
+specialist subagents, and a logbook/commit discipline that leaves clean history.
+
+usage:
+  $invoked_as [wt] [claude|codex] [options] [--] [prompt...]
+  $invoked_as worktrees [--fix]
+
+Both the mode and the agent are optional, so the shortest useful form is just
+"$invoked_as 'your task'" — in place, on your current branch, with Claude.
+
+modes:
+  (default)         IN PLACE. Runs at the repository root, on the branch you are
+                    already on. Your pre-existing uncommitted changes are left
+                    alone; the agent may commit its own work. The subagent team
+                    is installed temporarily, hidden from git status, and removed
+                    on exit — the repository is left exactly as it was found.
+
+  wt                WORKTREE. Cuts a fresh branch + worktree from <base> under
+                    <main-repo-parent>/<main-repo>.worktrees/ and works only
+                    there, then prints the merge-back recipe. Use it for anything
+                    risky, exploratory, long-running, or run in parallel.
+
+  worktrees         AUDIT. Lists every worktree of this repository with where it
+                    sits relative to the canonical root and what direnv makes of
+                    it, then prints the commands to fix anything off. Read-only
+                    unless you add --fix. Runs no agent.
+
+agents:
+  claude  (default) Claude Code — latest Opus, --effort max, ultracode
+                    orchestration, and the full autorun stack:
+                    --allow-dangerously-skip-permissions
+                    --dangerously-skip-permissions --permission-mode dontAsk.
+  codex             OpenAI Codex — newest model from Codex's own catalogue at
+                    that model's highest reasoning effort, fast tier, live web
+                    search, --dangerously-bypass-approvals-and-sandbox.
+
+options:
+  -a, --agent NAME  Which agent to run: codex or claude. Usually given as a
+                    bare word instead; omit entirely for the claude default.
+
+      --wt          Force worktree mode (same as the bare 'wt' word).
+      --here        Force in-place mode (useful for the *-wt wrappers).
+
+  -b, --base REF    Worktree mode only. Base ref to branch from.
+                    Default: your current branch (so the work fast-forwards
+                    straight back), falling back to the repo's default branch.
+
+  -n, --name NAME   Session label, in BOTH modes. Claude shows it in the prompt
+                    box, the /resume picker, and the terminal title. In worktree
+                    mode it additionally names the branch and directory, where it
+                    defaults to a slug generated from the prompt. (Codex has no
+                    launch-time session name — use its /name command in-session.)
+
+      --fix         'worktrees' mode only. Actually apply the repairs it lists
+                    instead of only printing them.
+
+  -h, --help        Show this help.
+
+examples:
+  The everyday case — Claude, right here, on your current branch:
+    $invoked_as "Add a rate limiter to the API gateway"
+    $invoked_as "Fix the failing auth test in tests/test_login.py"
+
+  Same thing with Codex — name it right after the mode:
+    $invoked_as codex "Fix the failing auth test in tests/test_login.py"
+
+  Interactive — no prompt, drop into a fully configured session:
+    $invoked_as              # guardrails + team preloaded; then /effort, /model, or just type
+    $invoked_as codex
+
+  Isolated worktree for risky or long-running work:
+    $invoked_as wt "Refactor the scheduler to use asyncio"
+    $invoked_as wt codex "Migrate the config loader to pydantic v2"
+
+  Worktree off another base, with a chosen branch name:
+    $invoked_as wt codex --base release/1.2 -n auth-backport "Backport the auth fix"
+        -> branch codex/auth-backport-<timestamp>
+
+  Naming a session without cutting a worktree:
+    $invoked_as -n auth-review "Why does login 500 on retry?"
+        -> in place, but the session shows up as "auth-review" in /resume
+
+  Auditing and repairing this repository's worktrees (direnv included):
+    $invoked_as worktrees          # report only
+    $invoked_as worktrees --fix    # move stray trees, prune dead ones, re-link
+                                   # and re-allow .envrc
+
+  Equivalent wrappers (all worktree mode):
+    claude-wt "Add a rate limiter"             ==  $invoked_as wt claude "..."
+    codex-wt -n perf "Profile the hot loop"    ==  $invoked_as wt codex -n perf "..."
+    agent-wt --here "quick fix"                # force in-place from a *-wt wrapper
+
+  Tuning a single run:
+    AGENT_CLAUDE_MODEL='claude-opus-5[1m]' $invoked_as "Audit this monorepo"
+    AGENT_CLAUDE_MODEL=sonnet $invoked_as "Rename these variables"
+    AGENT_CLAUDE_EFFORT=xhigh $invoked_as "..."              # if max overthinks
+    AGENT_CLAUDE_EFFORT= $invoked_as "..."                   # inherit settings.json
+    AGENT_CODEX_MODEL=gpt-5.6-terra $invoked_as codex "..."  # effort follows the model
+    AGENT_NO_AGENTS=1 $invoked_as "One-line typo fix"        # skip the subagent team
+    AGENT_NO_GPG_SIGN=0 $invoked_as "..."                    # keep your commit signing
+    AGENT_CLAUDE_PERMISSION_MODE=acceptEdits $invoked_as "..."  # edits free, commands ask
+
+  Multi-line or leading-dash prompts ('--' ends option parsing):
+    $invoked_as codex -- "- refactor the failing test
+    - then add a regression test"
+
+  Parallel sessions — use 'wt'. Two in-place runs in one repository share a
+  single scaffold, and whichever finishes first removes it:
+    $invoked_as wt       "Feature A" &
+    $invoked_as wt codex "Feature B" &
+
+environment overrides (legacy AGENT_WT_* names still honored):
+  AGENT_CLAUDE_MODEL            opus — alias for the latest Opus model
+                                (claude-opus-5[1m] for the 1M-token context)
+  AGENT_CLAUDE_EFFORT           max (empty = inherit effortLevel from settings.json)
+  AGENT_CLAUDE_PERMISSION_MODE  dontAsk — fallback autorun mode if bypass is
+                                vetoed (acceptEdits, auto, bypassPermissions,
+                                dontAsk, plan, manual; empty omits the flag)
+  AGENT_CLAUDE_SETTING_SOURCES  user,project,local (empty = Claude's default)
+  AGENT_CODEX_MODEL             newest listed model in Codex's own catalogue,
+                                falling back to gpt-5.6-sol
+  AGENT_CODEX_EFFORT            highest effort that model supports, else ultra
+  AGENT_CODEX_TIER              fast
+  AGENT_CODEX_SEARCH            1 — force live web search (0 omits --search)
+  AGENT_WORKTREE_DIR            <main-repo-parent>/<main-repo>.worktrees
+  AGENT_DIRENV                  1 — link + allow .envrc in each worktree and
+                                launch the agent under 'direnv exec' (0 disables)
+  AGENT_SUPPORT_DIR             $support_dir
+  AGENT_NO_AGENTS               0 (1 skips the bundled subagent team)
+  AGENT_NO_GPG_SIGN             1 — commits unsigned, scoped to this run so the
+                                auto-commits never block on a passphrase prompt
+                                (0 keeps your normal signing)
+
+notes:
+  * Neither model default is version-pinned, so neither goes stale: Claude uses
+    the 'opus' alias, and Codex reads the model catalogue its own CLI maintains.
+  * If a Claude session still shows "manual" in the mode indicator, bypass was
+    vetoed AND --permission-mode was dropped. Claude states the reason in-session
+    — org policy, a settings 'disableBypassPermissionsMode', or a disclaimer not
+    yet accepted interactively. dontAsk is exempt from that veto, so leaving
+    AGENT_CLAUDE_PERMISSION_MODE set keeps the run unattended regardless.
+    Caveat: under dontAsk anything that WOULD have prompted is denied rather than
+    asked, so 'ask' rules in your org settings become hard denials.
+  * This is ~/.local/bin/ai, not 'agent': the cursor-agent installer owns
+    ~/.local/bin/agent and recreates it on every self-update, so a script parked
+    there gets silently overwritten. 'agent' is left to Cursor.
+  * The bare words 'wt', 'here', 'worktrees', 'claude' and 'codex' are only
+    recognized while they lead the argument list — everything from the first
+    other word on is the prompt. So "$invoked_as claude wt ..." keeps 'wt' in the
+    prompt, and a task that genuinely starts with one of those words just needs
+    quoting: "$invoked_as 'codex is failing to build'" runs Claude on that prompt.
+  * Worktrees are always grouped next to the MAIN worktree, even when you launch
+    from inside another worktree. Everything for one repository therefore lands in
+    one predictable directory, which is also what makes the direnv blessing and
+    '$invoked_as worktrees' straightforward.
+  * direnv: each worktree gets a symlink to the main worktree's .envrc, that path
+    is 'direnv allow'-ed, and the agent runs under 'direnv exec' so it inherits
+    the project environment. Trust is only ever propagated from an .envrc you
+    already allowed — this never blesses one you have not reviewed. A repo
+    post-checkout hook that creates the same symlink is harmless: the link is only
+    created when absent, never replaced.
+  * The team — architect, precision-coder, critic, chronicler, test-engineer,
+    researcher, security-auditor — is installed as real subagents:
+    .claude/agents/*.md for Claude, .codex/agents/*.toml for Codex.
+  * No sandbox, no approval prompts. In-place mode has NO isolation: the agent
+    edits your real working tree and can commit to your current branch. Only run
+    it on tasks and repositories you trust.
+
+full docs: $support_dir/README.md
+EOF
+  exit 0
+}
+
+# ---- Small env helpers -----------------------------------------------------
+# first_set     : first NON-EMPTY value among the named vars (else fail).
+# first_defined : first value among the named vars that is SET, even if empty
+#                 (so an explicit empty value can mean "omit the flag").
+first_set() {
+  local n
+  for n in "$@"; do
+    if [ -n "${!n:-}" ]; then printf '%s' "${!n}"; return 0; fi
+  done
+  return 1
+}
+first_defined() {
+  local n
+  for n in "$@"; do
+    if [ -n "${!n+x}" ]; then printf '%s' "${!n}"; return 0; fi
+  done
+  return 1
+}
+
+# ---- Resolve this script's real directory (follow symlinks) ----------------
+src="${BASH_SOURCE[0]}"
+while [ -h "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in
+    /*) ;;            # absolute
+    *) src="$dir/$src" ;;
+  esac
+done
+script_dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+support_dir="$(first_set AGENT_SUPPORT_DIR AGENT_WT_SUPPORT_DIR || true)"
+if [ -z "$support_dir" ]; then
+  if [ -d "$script_dir/agent.d" ]; then
+    support_dir="$script_dir/agent.d"
+  else
+    support_dir="$script_dir/agent-wt.d"   # legacy layout
+  fi
+fi
+
+# ---- Model configuration ---------------------------------------------------
+# Claude: "opus" is an alias the CLI resolves to the newest Opus model, so this
+# never needs bumping. (`claude --model` accepts the opus / sonnet / haiku /
+# fable aliases or a full model id such as claude-opus-5.)
+CLAUDE_MODEL="$(first_set AGENT_CLAUDE_MODEL AGENT_WT_CLAUDE_MODEL || printf 'opus')"
+CLAUDE_EFFORT="$(first_defined AGENT_CLAUDE_EFFORT AGENT_WT_CLAUDE_EFFORT || printf 'max')"
+# Fallback autorun mode. --dangerously-skip-permissions asks for
+# bypassPermissions, but that one mode can be vetoed (org feature gate,
+# permissions.disableBypassPermissionsMode, or a disclaimer never accepted
+# interactively) — and when it is vetoed the session falls to "default", which the
+# UI labels "manual". --permission-mode is exempt from that veto and is the next
+# candidate Claude considers, so it keeps the session unattended either way.
+CLAUDE_PERMISSION_MODE="$(first_defined AGENT_CLAUDE_PERMISSION_MODE AGENT_WT_CLAUDE_PERMISSION_MODE \
+                          || printf 'dontAsk')"
+CLAUDE_SETTING_SOURCES="$(first_defined AGENT_CLAUDE_SETTING_SOURCES AGENT_WT_CLAUDE_SETTING_SOURCES \
+                          || printf 'user,project,local')"
+
+# Codex has no "latest" alias, but the CLI keeps a catalogue of the models your
+# account can use in $CODEX_HOME/models_cache.json, ranked by `priority` (1 =
+# newest/best). Read the top listed model and the highest reasoning effort it
+# supports, so this tracks new releases without editing the script. Falls back to
+# the known-good pinned values if the cache is missing or unreadable.
+codex_pick() {  # $1 = model override (may be empty); prints "<model>\n<effort>"
+  local cache="${CODEX_HOME:-$HOME/.codex}/models_cache.json"
+  [ -r "$cache" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$cache" "${1:-}" <<'PY' 2>/dev/null
+import json, sys
+
+try:
+    models = json.load(open(sys.argv[1])).get("models", [])
+except Exception:
+    sys.exit(1)
+
+override = sys.argv[2] if len(sys.argv) > 2 else ""
+if override:
+    chosen = next((m for m in models if m.get("slug") == override), None)
+else:
+    listed = [m for m in models
+              if m.get("visibility") == "list" and m.get("priority") is not None]
+    chosen = min(listed, key=lambda m: m["priority"], default=None)
+if chosen is None:
+    sys.exit(1)
+
+# Best -> worst; the cache lists what each model actually supports.
+ranked = ["ultra", "max", "xhigh", "high", "medium", "low"]
+supported = {e.get("effort") for e in chosen.get("supported_reasoning_levels", [])}
+effort = next((e for e in ranked if e in supported), "")
+
+print(chosen.get("slug", ""))
+print(effort)
+PY
+}
+
+CODEX_MODEL="$(first_set AGENT_CODEX_MODEL AGENT_WT_CODEX_MODEL || true)"
+codex_picked="$(codex_pick "$CODEX_MODEL" || true)"
+[ -n "$CODEX_MODEL" ] || CODEX_MODEL="$(printf '%s' "$codex_picked" | sed -n 1p)"
+CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_EFFORT="$(first_set AGENT_CODEX_EFFORT AGENT_WT_CODEX_EFFORT || true)"
+[ -n "$CODEX_EFFORT" ] || CODEX_EFFORT="$(printf '%s' "$codex_picked" | sed -n 2p)"
+CODEX_EFFORT="${CODEX_EFFORT:-ultra}"
+CODEX_TIER="$(first_set AGENT_CODEX_TIER AGENT_WT_CODEX_TIER || printf 'fast')"
+# Explicit empty value also disables --search.
+CODEX_SEARCH="$(first_defined AGENT_CODEX_SEARCH AGENT_WT_CODEX_SEARCH || printf '1')"
+
+# ---- Parse arguments -------------------------------------------------------
+agent=""
+base=""          # empty => resolve to current/default branch below
+name=""
+audit=0          # 'worktrees' mode: report on the repo's worktrees, run no agent
+audit_fix=0      # ... and actually apply the repairs
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --wt|--worktree)
+      use_worktree=1
+      shift
+      ;;
+    --here|--in-place|--no-wt)
+      use_worktree=0
+      shift
+      ;;
+    --fix)
+      audit_fix=1
+      shift
+      ;;
+    wt|here|worktrees)
+      # Bare mode words are only meaningful before the agent is chosen; after
+      # that they are part of the prompt.
+      if [ -z "$agent" ]; then
+        case "$1" in
+          wt)        use_worktree=1 ;;
+          here)      use_worktree=0 ;;
+          worktrees) audit=1 ;;
+        esac
+        shift
+      else
+        break
+      fi
+      ;;
+    -a|--agent)
+      [ "$#" -ge 2 ] || usage
+      agent="$2"
+      shift 2
+      ;;
+    -b|--base)
+      [ "$#" -ge 2 ] || usage
+      base="$2"
+      shift 2
+      ;;
+    -n|--name)
+      [ "$#" -ge 2 ] || usage
+      name="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    codex|claude)
+      # First bare codex/claude token selects the agent; once set, it is prompt.
+      if [ -z "$agent" ]; then
+        agent="$1"
+        shift
+      else
+        break
+      fi
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# The agent name is optional; Claude is the default.
+agent="${agent:-claude}"
+case "$agent" in
+  codex|claude) ;;
+  *) echo "Invalid agent: '$agent' (use codex or claude)." >&2; usage ;;
+esac
+
+# --base cuts a branch, so it is still worktree-only. --name is a session label
+# in both modes now, and only additionally names the branch under 'wt'.
+if [ "$use_worktree" -eq 0 ] && [ -n "$base" ]; then
+  echo "--base only applies in worktree mode; add 'wt' (e.g. $invoked_as wt $agent ...)." >&2
+  exit 2
+fi
+if [ "$audit_fix" -eq 1 ] && [ "$audit" -eq 0 ]; then
+  echo "--fix only applies to '$invoked_as worktrees'." >&2
+  exit 2
+fi
+
+# Prompt is optional: with a prompt the agent runs it immediately; without one,
+# we drop you into an interactive session with everything already configured.
+prompt="$*"
+
+# ---- Locate the repository -------------------------------------------------
+repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ "$use_worktree" -eq 1 ] && [ -z "$repo" ]; then
+  echo "Not inside a git repository (or it is bare); worktree mode needs one." >&2
+  echo "Run without 'wt' to work in place in the current directory." >&2
+  exit 1
+fi
+if [ "$audit" -eq 1 ] && [ -z "$repo" ]; then
+  echo "Not inside a git repository; '$invoked_as worktrees' needs one." >&2
+  exit 1
+fi
+current_branch=""
+[ -n "$repo" ] && current_branch="$(git -C "$repo" branch --show-current || true)"
+
+# The MAIN worktree anchors everything path-shaped: new worktrees are grouped
+# beside it and its .envrc is the direnv source. `git rev-parse --show-toplevel`
+# is the WRONG anchor because inside a linked worktree it returns that worktree —
+# which is how <name>.worktrees/ directories ended up nested inside other
+# worktrees. `git worktree list` always reports the main worktree first, and that
+# holds from anywhere in the repository.
+main_worktree=""
+main_is_bare=""
+if [ -n "$repo" ]; then
+  # First record only: porcelain separates records with a blank line.
+  # `|| true`: under `set -e -o pipefail` a failing git here would abort the whole
+  # script with no message, and the fallback just below handles an empty result.
+  wt_head="$(git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n '1,/^$/p' || true)"
+  main_worktree="$(printf '%s\n' "$wt_head" | sed -n '1s/^worktree //p')"
+  printf '%s\n' "$wt_head" | grep -qx 'bare' && main_is_bare=1
+  # Older git, or anything unexpected: fall back to the current worktree.
+  [ -n "$main_worktree" ] && [ -d "$main_worktree" ] || { main_worktree="$repo"; main_is_bare=""; }
+fi
+
+# Canonical home for this repository's worktrees. A bare main repo is normally
+# named <repo>.git, and grouping under <repo>.git.worktrees would read badly.
+wt_root=""
+if [ -n "$main_worktree" ]; then
+  anchor_name="$(basename "$main_worktree")"
+  [ -n "$main_is_bare" ] && anchor_name="${anchor_name%.git}"
+  wt_root="$(first_set AGENT_WORKTREE_DIR AGENT_WT_WORKTREE_DIR CODEX_WORKTREE_DIR \
+             || printf '%s/%s.worktrees' "$(dirname "$main_worktree")" "$anchor_name")"
+  # A relative override would otherwise mean different things to `git worktree
+  # add` (resolved against the cwd) and to the audit's prefix comparisons against
+  # git's always-absolute paths.
+  case "$wt_root" in
+    /*) ;;
+    *)  wt_root="$PWD/$wt_root" ;;
+  esac
+fi
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"   # PID suffix avoids same-second collisions
+
+# ---- direnv integration ----------------------------------------------------
+# See the "direnv" note in the header for the rationale. In short: link the main
+# worktree's .envrc into each worktree, bless that path, and launch the agent
+# under `direnv exec` so the AGENT — not just your interactive shell — sees the
+# project environment.
+use_direnv="$(first_defined AGENT_DIRENV AGENT_WT_DIRENV || printf '1')"
+direnv_note=""
+direnv_launch=()   # command prefix for the agent launch; empty = launch directly
+
+# direnv normalises paths inconsistently: `direnv allow` resolves symlinks, while
+# `direnv exec` only cleans the path. Feed both the PHYSICAL path so the token
+# `allow` writes is the one `exec` looks up.
+direnv_phys() { readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# Any DIRENV_* variables we inherited describe the environment of whatever
+# launched US, not the directory we are asking about. That matters more than it
+# sounds: `direnv status --json` reports the caller's "loadedRC" right next to the
+# directory's "foundRC", each with its own "allowed" field, so a probe run from
+# inside any direnv-active shell — including the agent this script itself starts
+# under `direnv exec` — would otherwise see somebody else's allowed .envrc and
+# conclude that THIS one is allowed. Scrub the state from every direnv call.
+direnv_scrub=(env)
+for _dv in ${!DIRENV_@}; do direnv_scrub+=(-u "$_dv"); done
+unset _dv
+
+# direnv_run <args...> — direnv, scrubbed and on a clock. The timeout is not
+# belt-and-braces: an .envrc that reads stdin, or one symlinked to a FIFO with no
+# writer, hangs `allow`/`exec` indefinitely and the agent would never start. Only
+# the short-lived probes get it; the launch itself must be able to run for hours.
+direnv_timeout=()
+command -v timeout >/dev/null 2>&1 && direnv_timeout=(timeout 20)
+direnv_run() { "${direnv_timeout[@]+"${direnv_timeout[@]}"}" "${direnv_scrub[@]}" direnv "$@"; }
+
+# direnv_ok <dir> — true when direnv can RUN a command for <dir>: nothing is in
+# scope, or what is loads without error. `direnv exec` is the probe on purpose —
+# it is the exact code path the launch uses, so the probe cannot disagree with it.
+# This is NOT the question "is it allowed": on an explicitly DENIED .envrc, direnv
+# exec still runs the command, silently, with no environment, and exits 0.
+direnv_ok() { direnv_run exec "$(direnv_phys "$1")" true >/dev/null 2>&1; }
+
+# direnv_allowed <dir> — STRICT, and fails CLOSED. True only when direnv positively
+# reports that the .envrc it found for <dir> is allowed. False for blocked (1),
+# explicitly denied (2), no .envrc at all, and for any output we cannot parse.
+#
+# Only "foundRC" is consulted, and only after the surrounding blob is sliced away:
+# scrubbing DIRENV_* already removes the caller's "loadedRC", and this makes a
+# stray second "allowed" harmless even if it does not. Failing closed on
+# unparseable output is deliberate — this predicate gates granting trust, so an
+# unrecognised direnv must disable the feature, never wave it through.
+# An optional second argument pins WHICH .envrc the answer is about: direnv
+# searches upward, so without it "allowed" might be describing an ancestor's file.
+# bless_envrc passes the exact path it is about to bless; the launch decision
+# leaves it off, because inheriting an allowed parent .envrc is legitimate there.
+direnv_allowed() {
+  local json found rcpath
+  json="$( cd "$(direnv_phys "$1")" 2>/dev/null && direnv_run status --json 2>/dev/null )" || return 1
+  case "$json" in *'"foundRC"'*) ;; *) return 1 ;; esac
+  found="${json#*\"foundRC\"}"
+  found="${found%%\"loadedRC\"*}"
+  case "$found" in *'"allowed"'*) ;; *) return 1 ;; esac
+  if [ -n "${2:-}" ]; then
+    rcpath="${found#*\"path\"}"; rcpath="${rcpath#*\"}"; rcpath="${rcpath%%\"*}"
+    [ "$rcpath" = "$2" ] || return 1
+  fi
+  printf '%s' "$found" | grep -qE '"allowed"[[:space:]]*:[[:space:]]*0'
+}
+
+# find_envrc <dir> — nearest .envrc/.env at or above <dir>, mirroring direnv's own
+# upward search. Empty output means direnv has nothing to load there.
+find_envrc() {
+  local d="$1"
+  [ -n "$d" ] || return 1
+  while :; do
+    [ -e "$d/.envrc" ] && { printf '%s\n' "$d/.envrc"; return 0; }
+    [ -e "$d/.env" ]   && { printf '%s\n' "$d/.env";   return 0; }
+    [ "$d" = "/" ] && return 1
+    d="$(dirname "$d")"
+  done
+}
+
+# link_envrc <dir> — give <dir> an .envrc of its own, pointing at the main
+# worktree's. The target is absolute so the link survives `git worktree move`.
+# Never clobbers: a repo post-checkout hook may already have made this exact link,
+# and the checked-out branch may carry a committed .envrc of its own. A DANGLING
+# link is replaced — it points nowhere, so there is nothing to preserve.
+link_envrc() {
+  local dir="$1" src="$main_worktree/.envrc" rc="$1/.envrc"
+  [ -f "$src" ] || return 1
+  if [ -e "$rc" ]; then
+    return 1
+  elif [ -L "$rc" ]; then
+    rm -f -- "$rc"
+  fi
+  ln -s "$src" "$rc" 2>/dev/null
+}
+
+# envrc_trusted_copy <rc> <src> — is <rc> the same .envrc as <src>, such that
+# <src>'s existing blessing may be extended to it? True for the symlink we create,
+# and for a byte-identical file (e.g. one a branch happens to have committed).
+envrc_trusted_copy() {
+  local a b
+  # -f, not -e, and it is load-bearing on both sides. -f follows symlinks and is
+  # true only for a REGULAR file, which rules out a directory named .envrc (direnv
+  # skips those and keeps walking up, so `allow` would bless an ancestor while we
+  # inspected something else) and a symlink to a FIFO or socket (where `cmp` and
+  # `direnv allow` read the stream twice and can be served different bytes each
+  # time — a deterministic version of the race below, and a hang besides).
+  [ -f "$1" ] && [ -f "$2" ] || return 1
+  # Bind and require non-empty: two failed readlinks both print nothing, and
+  # comparing "" to "" would answer "same file" for two paths that do not exist.
+  a="$(readlink -f -- "$1" 2>/dev/null)" || a=""
+  b="$(readlink -f -- "$2" 2>/dev/null)" || b=""
+  [ -n "$a" ] && [ "$a" = "$b" ] && return 0
+  cmp -s "$1" "$2"
+}
+
+# bless_envrc <dir> — extend the main worktree's existing direnv trust to <dir>'s
+# copy. Deliberately conservative: it refuses to allow an .envrc whose contents the
+# user has not already allowed, and refuses while the source itself is blocked, so
+# `ai` can only ever propagate trust, never manufacture it.
+#
+# The DIRECTORY is passed to `direnv allow`, never "$dir/.envrc", and this is the
+# whole trick. Given a file, direnv resolves symlinks over the entire path — so it
+# blesses the shared target and leaves the worktree blocked, while still exiting 0.
+# Given a directory it resolves only the directory and then joins ".envrc" plainly,
+# recording the worktree's own path, which is the one `direnv exec` looks up. The
+# `-e "$rc"` guard matters here too: `allow` on a directory searches UPWARD, so
+# without it an empty worktree would bless some parent's .envrc instead.
+bless_envrc() {
+  local dir="$1" src="$main_worktree/.envrc" rc="$1/.envrc" phys
+  phys="$(direnv_phys "$dir")"
+  [ -f "$rc" ] || return 1
+  # Already blessed: nothing to do. (Worth checking — it is the common case on
+  # relaunch, and it keeps --fix from reporting repairs it did not make.)
+  direnv_allowed "$dir" "$phys/.envrc" && return 1
+  envrc_trusted_copy "$rc" "$src" || return 1
+  direnv_allowed "$main_worktree" "$(direnv_phys "$main_worktree")/.envrc" || return 1
+  direnv_run allow "$phys" >/dev/null 2>&1 || return 1
+  # Re-check what we just blessed. `direnv allow` re-reads the file, so anything
+  # able to write $rc between the comparison above and this point would otherwise
+  # have arbitrary content blessed. Deliberately no `direnv deny` on failure:
+  # deny resolves symlinks the same way allow does, so it would revoke the SHARED
+  # source instead of this copy. Report and refuse to load it.
+  if ! envrc_trusted_copy "$rc" "$src"; then
+    echo "WARN: $rc changed while it was being allowed — not loading it." >&2
+    return 1
+  fi
+  direnv_allowed "$dir" "$phys/.envrc"
+}
+
+# setup_direnv — run once for the chosen working root, just before launch. Never
+# fatal: every failure downgrades to a plain launch and says why. Re-running the
+# link+bless on every launch is deliberate — direnv keys trust on the .envrc's
+# CONTENTS as well as its path, so editing the shared .envrc blocks every worktree
+# at once, and this is what quietly heals them.
+setup_direnv() {
+  local found
+
+  if [ "$use_direnv" = "0" ]; then direnv_note="off (AGENT_DIRENV=0)"; return 0; fi
+  if ! command -v direnv >/dev/null 2>&1; then
+    direnv_note="off (direnv not installed)"
+    return 0
+  fi
+
+  if [ "$use_worktree" -eq 1 ] && [ -n "$main_worktree" ]; then
+    link_envrc  "$work_dir" || true
+    bless_envrc "$work_dir" || true
+  fi
+
+  found="$(find_envrc "$work_dir" || true)"
+  if [ -z "$found" ]; then
+    direnv_note="no .envrc in scope"
+  elif ! direnv_allowed "$work_dir"; then
+    direnv_note="NOT loaded — $found is blocked or denied"
+    echo "WARN: direnv has not allowed $found, so the agent will run WITHOUT the" >&2
+    echo "      project environment. Review it, then run:" >&2
+    echo "        direnv allow $(printf '%q' "$(dirname "$found")")" >&2
+    echo "      (the directory, not the file — see 'The symlink trap' in the README)" >&2
+  elif direnv_ok "$work_dir"; then
+    direnv_launch=("${direnv_scrub[@]}" direnv exec "$(direnv_phys "$work_dir")")
+    direnv_note="$found"
+  else
+    direnv_note="NOT loaded — $found is allowed but failed to evaluate"
+    echo "WARN: $found is allowed but errored, so the agent will run WITHOUT the" >&2
+    echo "      project environment. Check it with:  direnv exec \"$work_dir\" true" >&2
+  fi
+}
+
+# ---- 'worktrees': audit / repair -------------------------------------------
+# Answers two questions about the repository you are standing in: is every
+# worktree where it should be, and will direnv hand each of them the project
+# environment. Read-only unless --fix is given.
+#
+# Repairs are graded by how certain the intent is:
+#   GONE   (registration without a directory)      -> pruned by --fix
+#   NESTED (inside another tree's <name>.worktrees/) -> moved by --fix. That is
+#          the old anchor bug's exact signature and nothing else produces it.
+#   DEEP   (under the root, but in a layout of your own — a '/' in --name makes
+#          one)                                    -> NEVER moved automatically
+#   STRAY  (somewhere else entirely)               -> NEVER moved automatically,
+#          because you may well have put it there on purpose.
+# For the two "never" cases the exact `git worktree move` line is printed instead,
+# so you can opt in per tree. Moving a tree breaks absolute paths into it (venvs,
+# IDE/LSP state, direnv blessings), which is the user's call to make, not ours.
+# direnv repairs (link + allow) apply to every live worktree either way.
+run_audit() {
+  local rc_src="$main_worktree/.envrc"
+  local direnv_state src_allowed="" direnv_usable=""
+  local line path branch flag label dstate display dst parent i
+  local -a paths=() flags=() labels=() dstates=()
+  local -a moves=() suggest=() live=()
+  local issues=0 fixed=0
+
+  if [ "$use_direnv" = "0" ]; then
+    direnv_state="off (AGENT_DIRENV=0)"
+  elif ! command -v direnv >/dev/null 2>&1; then
+    direnv_state="off (direnv not installed)"
+  elif [ ! -f "$rc_src" ]; then
+    direnv_usable=1
+    direnv_state="no .envrc in the main worktree — nothing to propagate"
+  elif direnv_allowed "$main_worktree" "$(direnv_phys "$main_worktree")/.envrc"; then
+    direnv_usable=1
+    src_allowed=1
+    direnv_state="$rc_src (allowed)"
+  else
+    direnv_usable=1
+    direnv_state="$rc_src (BLOCKED — run: direnv allow \"$rc_src\")"
+  fi
+
+  echo "repository:     $main_worktree"
+  echo "worktree root:  $wt_root"
+  echo "direnv source:  $direnv_state"
+  echo
+
+  # Collect the porcelain records. Records are separated by blank lines; the
+  # fields that matter are the path, the branch, and whether git already considers
+  # the registration prunable or locked.
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)
+        if [ -n "${path:-}" ]; then
+          paths+=("$path")
+          flags+=("${flag:-live}|${branch:-}")
+        fi
+        path="${line#worktree }"; branch=""; flag=""
+        ;;
+      "branch refs/heads/"*) branch="${line#branch refs/heads/}" ;;
+      "detached")            branch="(detached)" ;;
+      "bare")                branch="(bare)" ;;
+      "prunable "*)          flag="GONE" ;;
+      "locked"|"locked "*)   flag="LOCKED" ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain 2>/dev/null)
+  if [ -n "${path:-}" ]; then
+    paths+=("$path")
+    flags+=("${flag:-live}|${branch:-}")
+  fi
+
+  # Classify every row before touching anything, so the table describes the state
+  # as found and --fix reports separately on what it changed.
+  for (( i=0; i<${#paths[@]}; i++ )); do
+    path="${paths[i]}"
+    flag="${flags[i]%%|*}"
+
+    if [ "$path" = "$main_worktree" ]; then
+      label="main"
+    elif [ "$flag" = "GONE" ]; then
+      label="GONE"
+    elif [ "$flag" = "LOCKED" ]; then
+      label="LOCKED"
+    elif [ "$path" = "$wt_root/$(basename "$path")" ]; then
+      label="ok"
+    elif [ "${path#"$wt_root"/}" != "$path" ]; then
+      # Under the root but not directly under it. Only the anchor bug's exact
+      # signature — a tree inside another tree's own "<name>.worktrees/" — is
+      # auto-consolidated. Any other depth is a layout the user chose (a '/' in
+      # --name produces one), so it is reported and left alone.
+      case "${path#"$wt_root"/}" in
+        *.worktrees/*) label="NESTED" ;;
+        *)             label="DEEP" ;;
+      esac
+    else
+      label="STRAY"
+    fi
+
+    if [ -z "$direnv_usable" ] || [ ! -d "$path" ]; then
+      dstate="-"
+    elif [ ! -e "$path/.envrc" ] && [ -f "$rc_src" ] && [ "$path" != "$main_worktree" ]; then
+      dstate="missing"
+    elif [ -z "$(find_envrc "$path" || true)" ]; then
+      dstate="-"
+    elif direnv_allowed "$path"; then
+      dstate="ok"
+    else
+      dstate="blocked"
+    fi
+
+    labels+=("$label")
+    dstates+=("$dstate")
+
+    case "$label" in
+      main|ok) ;;
+      *)       issues=$((issues + 1)) ;;
+    esac
+    case "$dstate" in
+      missing|blocked) issues=$((issues + 1)) ;;
+    esac
+
+    case "$label" in
+      NESTED)     moves+=("$path") ;;
+      # %q, not double quotes: these lines are printed for the user to paste into
+      # a shell, and a path containing $(...) or a backtick would otherwise run.
+      STRAY|DEEP) suggest+=("git -C $(printf '%q' "$repo") worktree move $(printf '%q' "$path") $(printf '%q' "$wt_root/$(basename "$path")")") ;;
+    esac
+    if [ "$label" != "main" ] && [ "$label" != "GONE" ] && [ -d "$path" ]; then
+      live+=("$path")
+    fi
+  done
+
+  printf '  %-7s %-8s %s\n' "PLACE" "DIRENV" "WORKTREE"
+  for (( i=0; i<${#paths[@]}; i++ )); do
+    path="${paths[i]}"
+    branch="${flags[i]#*|}"
+    display="$path"
+    if [ "${path#"$wt_root"/}" != "$path" ]; then
+      display="<root>/${path#"$wt_root"/}"
+    fi
+    printf '  %-7s %-8s %s\n' "${labels[i]}" "${dstates[i]}" "$display"
+    if [ -n "$branch" ]; then
+      printf '  %-7s %-8s   %s\n' "" "" "$branch"
+    fi
+  done
+  echo
+
+  if [ "$audit_fix" -eq 0 ]; then
+    if [ "$issues" -eq 0 ]; then
+      echo "Everything is where it should be, and direnv is happy with all of it."
+    else
+      echo "$issues issue(s). '$invoked_as worktrees --fix' prunes dead registrations,"
+      echo "consolidates NESTED trees, and re-links / re-allows .envrc everywhere."
+    fi
+    if [ "${#suggest[@]}" -gt 0 ]; then
+      echo
+      echo "STRAY/DEEP trees are never moved automatically — you may well have put"
+      echo "them there on purpose, and moving a tree breaks absolute paths into it"
+      echo "(venvs, IDE state). To consolidate one, run it yourself:"
+      printf '  %s\n' "${suggest[@]}"
+    fi
+    [ "$issues" -eq 0 ] || return 1
+    return 0
+  fi
+
+  # --fix. Prune first so the moves cannot trip over dead registrations.
+  git -C "$repo" worktree prune 2>/dev/null || true
+  mkdir -p "$wt_root" 2>/dev/null || true
+
+  for path in ${moves[@]+"${moves[@]}"}; do
+    dst="$wt_root/$(basename "$path")"
+    if [ -e "$dst" ]; then
+      echo "skip: $dst already exists — move '$path' by hand." >&2
+      continue
+    fi
+    # Moving the tree we are standing in would leave this shell (and every
+    # subsequent `git -C "$repo"` here) pointing at a path that no longer exists.
+    if [ "$path" = "$repo" ]; then
+      echo "skip: '$path' is the worktree you are in — re-run from elsewhere:" >&2
+      echo "        (cd \"$main_worktree\" && $invoked_as worktrees --fix)" >&2
+      continue
+    fi
+    if git -C "$repo" worktree move "$path" "$dst"; then
+      echo "moved: $path -> $dst"
+      fixed=$((fixed + 1))
+      # Track the NEW path for the direnv pass, and tidy the container the old
+      # anchor bug left behind if nothing else lives in it.
+      live+=("$dst")
+      parent="$(dirname "$path")"
+      rmdir "$parent" 2>/dev/null || true
+    else
+      echo "FAILED to move $path (dirty tree, submodules, or a lock)." >&2
+    fi
+  done
+
+  # direnv pass, over the post-move paths. A move invalidates the old blessing
+  # (direnv keys it on the path), and the .envrc symlink is absolute so it rode
+  # along intact — re-blessing at the new path is all that is needed.
+  if [ -n "$direnv_usable" ]; then
+    for path in ${live[@]+"${live[@]}"}; do
+      [ -d "$path" ] || continue
+      if link_envrc "$path"; then
+        echo "linked: $path/.envrc -> $rc_src"
+        fixed=$((fixed + 1))
+      fi
+      if [ -n "$src_allowed" ] && bless_envrc "$path"; then
+        fixed=$((fixed + 1))
+      fi
+    done
+    if [ -f "$rc_src" ] && [ -z "$src_allowed" ]; then
+      echo
+      echo "NOTE: nothing could be blessed — the source .envrc is not allowed yet." >&2
+      echo "      Review it, then:  direnv allow \"$rc_src\"" >&2
+    fi
+  fi
+
+  echo
+  echo "$fixed repair(s) applied. Re-run '$invoked_as worktrees' to confirm."
+  if [ "${#suggest[@]}" -gt 0 ]; then
+    echo
+    echo "STRAY/DEEP trees were left alone. To consolidate one:"
+    printf '  %s\n' "${suggest[@]}"
+  fi
+  return 0
+}
+
+if [ "$audit" -eq 1 ]; then
+  run_audit
+  exit $?
+fi
+
+# ---- Establish the working root --------------------------------------------
+# Worktree mode: a fresh worktree. In-place mode: the repository root (or the
+# current directory when this isn't a repo), mirroring worktree mode so project
+# config (.claude/, .codex/, CLAUDE.md, AGENTS.md) resolves the same way.
+branch=""
+target_branch=""
+merge_back=""
+
+if [ "$use_worktree" -eq 1 ]; then
+  if git -C "$repo" remote | grep -q .; then
+    git -C "$repo" fetch --quiet --all --prune || true
+  fi
+
+  # Default base to the current branch so work fast-forwards straight back.
+  # Fall back to the repo's default branch when on a detached HEAD.
+  if [ -z "$base" ]; then
+    if [ -n "$current_branch" ]; then
+      base="$current_branch"
+    elif origin_head="$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"; then
+      base="${origin_head#origin/}"
+    elif git -C "$repo" rev-parse --verify --quiet master >/dev/null 2>&1; then
+      base="master"
+    else
+      base="main"
+    fi
+  fi
+
+  git -C "$repo" rev-parse --verify --quiet "$base^{commit}" >/dev/null || {
+    echo "Base ref not found: $base" >&2
+    exit 1
+  }
+
+  # Where the finished work should land. Normally the branch you were on; on a
+  # detached HEAD there is no obvious branch, so target the base and say so.
+  if [ -n "$current_branch" ]; then
+    target_branch="$current_branch"
+  else
+    target_branch="$base"
+    echo "note: detached HEAD — merge-back will target '$base'." >&2
+  fi
+
+  # ---- Derive worktree + branch names --------------------------------------
+  # $name stays exactly as the user typed it — it is the session LABEL, where
+  # spaces and capitals are welcome. $slug is the sanitised form that becomes a
+  # directory and a branch, and an explicit --name goes through the same filter as
+  # a prompt-derived one: a '/' would otherwise nest the worktree a level down,
+  # and '..' would abort mid-run with a raw git "not a valid branch name".
+  slug="$(
+    printf '%s' "${name:-$prompt}" |
+      LC_ALL=C tr '[:upper:]' '[:lower:]' |
+      LC_ALL=C tr -cs 'a-z0-9._-' '-' |
+      sed 's/--*/-/g' |
+      cut -c1-40 |
+      sed 's/^[.-]*//; s/[.-]*$//'
+  )"
+  # Empty (or nothing to derive from) -> a generic interactive-session name.
+  case "$slug" in ""|"."|"..") slug="session" ;; esac
+  if [ -n "$name" ] && [ "$slug" != "$name" ]; then
+    echo "note: branch/worktree named '$slug' (sanitised from '$name')." >&2
+  fi
+  # No explicit label given: let the derived slug name the session too.
+  [ -n "$name" ] || name="$slug"
+
+  branch="${agent}/${slug}-${stamp}"
+  # $wt_root hangs off the MAIN worktree, not the current one, so launching from
+  # inside a worktree still lands the new tree beside its siblings.
+  work_dir="$wt_root/${slug}-${stamp}"
+
+  mkdir -p "$wt_root"
+  git -C "$repo" worktree add -b "$branch" "$work_dir" "$base"
+
+  merge_back="$(cat <<MB
+cd "$repo"
+git switch "$target_branch"
+git merge --ff-only "$branch"        # if this is rejected, use:  git merge --no-ff "$branch"
+git worktree remove "$work_dir"
+git branch -d "$branch"
+MB
+  )"
+else
+  work_dir="${repo:-$PWD}"
+  base=""
+fi
+
+# State of the tree as we found it, so the agent can report exactly what it did
+# and can be told to leave pre-existing work alone.
+start_sha=""
+pre_existing_changes=""
+if [ -n "$repo" ]; then
+  start_sha="$(git -C "$work_dir" rev-parse --short HEAD 2>/dev/null || true)"
+  if [ "$use_worktree" -eq 0 ] && [ -n "$(git -C "$work_dir" status --porcelain 2>/dev/null)" ]; then
+    pre_existing_changes=1
+  fi
+fi
+
+# Commit signing: OFF by default so the chronicler's auto-commits never block on
+# a GPG passphrase prompt (which would defeat the "no asking" goal). Scoped to
+# THIS run via GIT_CONFIG_* env vars that the agent's git invocations inherit —
+# the repo's own git config is never touched (worktrees share .git/config, so
+# writing to it would leak repo-wide). Set AGENT_NO_GPG_SIGN=0 to keep signing.
+no_gpg="$(first_set AGENT_NO_GPG_SIGN AGENT_WT_NO_GPG_SIGN || printf '1')"
+if [ "$no_gpg" != "0" ]; then
+  gpg_idx="${GIT_CONFIG_COUNT:-0}"
+  export "GIT_CONFIG_KEY_${gpg_idx}=commit.gpgsign"
+  export "GIT_CONFIG_VALUE_${gpg_idx}=false"
+  export GIT_CONFIG_COUNT=$((gpg_idx + 1))
+  gpg_sign_note="off (unsigned, scoped to this run)"
+else
+  gpg_sign_note="on (your git config)"
+fi
+
+# ---- Temporary-scaffold bookkeeping (in-place mode) ------------------------
+# In a worktree everything is throwaway. In place, we must leave the repository
+# exactly as we found it: track every file/dir we create, remove them on exit,
+# and keep them out of `git status` meanwhile so an over-eager `git add -A`
+# can't sweep them into a commit.
+created_files=()
+created_dirs=()
+exclude_file=""
+exclude_marker="agent scaffold ${stamp}"
+devlog_scaffolded=""
+
+cleanup_scaffold() {
+  local f i tmp
+  for f in "${created_files[@]-}"; do
+    [ -n "$f" ] && rm -f -- "$f"
+  done
+  for (( i=${#created_dirs[@]}-1; i>=0; i-- )); do
+    rmdir -- "${created_dirs[i]}" 2>/dev/null || true
+  done
+  # Only remove a scaffolded DEVLOG.md if nothing ever wrote to it.
+  if [ -n "$devlog_scaffolded" ] && [ -f "$work_dir/DEVLOG.md" ] \
+     && cmp -s "$work_dir/DEVLOG.md" "$support_dir/DEVLOG.template.md"; then
+    rm -f -- "$work_dir/DEVLOG.md"
+  fi
+  if [ -n "$exclude_file" ] && [ -f "$exclude_file" ]; then
+    tmp="$(mktemp)" || return 0
+    if awk -v m="$exclude_marker" '
+         $0 == "# >>> " m { skip = 1; next }
+         $0 == "# <<< " m { skip = 0; next }
+         !skip
+       ' "$exclude_file" >"$tmp"; then
+      cat "$tmp" >"$exclude_file"   # rewrite in place, preserving permissions
+    fi
+    rm -f -- "$tmp"
+  fi
+}
+
+track_mkdir() {  # create dir (and remember it) only if it did not already exist
+  local d="$1"
+  [ -d "$d" ] && return 0
+  mkdir -p -- "$d"
+  [ "$use_worktree" -eq 0 ] && created_dirs+=("$d")
+  return 0
+}
+
+install_file() {  # never clobber a file the user already has
+  local src_file="$1" dest="$2"
+  [ -e "$dest" ] && return 1
+  cp -- "$src_file" "$dest"
+  [ "$use_worktree" -eq 0 ] && created_files+=("$dest")
+  return 0
+}
+
+git_ignore_locally() {  # hide the scaffold from git status, for this session only
+  local pattern common
+  [ -n "$repo" ] || return 0
+  common="$(git -C "$work_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  [ -n "$common" ] && [ -d "$common/info" ] || return 0
+  exclude_file="$common/info/exclude"
+  {
+    printf '# >>> %s\n' "$exclude_marker"
+    for pattern in "$@"; do printf '%s\n' "$pattern"; done
+    printf '# <<< %s\n' "$exclude_marker"
+  } >>"$exclude_file" || exclude_file=""
+}
+
+if [ "$use_worktree" -eq 0 ]; then
+  trap cleanup_scaffold EXIT INT TERM
+fi
+
+# ---- Install the bundled subagent team -------------------------------------
+# Claude reads .claude/agents/*.md; Codex reads .codex/agents/*.toml (and the
+# launch marks the working root trusted so Codex loads its project layers).
+agents_installed="none"
+no_agents="$(first_set AGENT_NO_AGENTS AGENT_WT_NO_AGENTS || printf '0')"
+if [ "$no_agents" != "1" ]; then
+  case "$agent" in
+    claude) team_dir="$work_dir/.claude/agents"; team_src="$support_dir/agents";       team_glob="*.md" ;;
+    codex)  team_dir="$work_dir/.codex/agents";  team_src="$support_dir/codex-agents"; team_glob="*.toml" ;;
+  esac
+
+  shopt -s nullglob
+  team_files=("$team_src/"$team_glob)
+  shopt -u nullglob
+
+  if [ "${#team_files[@]}" -gt 0 ]; then
+    track_mkdir "$(dirname "$team_dir")"
+    track_mkdir "$team_dir"
+    for f in "${team_files[@]}"; do
+      install_file "$f" "$team_dir/$(basename "$f")" || true
+    done
+    agents_installed="$team_dir (${#team_files[@]} agents)"
+    if [ "$use_worktree" -eq 0 ]; then
+      agents_installed="$agents_installed [temporary — removed on exit]"
+      case "$agent" in
+        claude) git_ignore_locally '/.claude/agents/' ;;
+        codex)  git_ignore_locally '/.codex/agents/' ;;
+      esac
+    fi
+  else
+    echo "WARN: no subagent definitions found in $team_src —" >&2
+    echo "      $agent will be told to use a team that isn't installed." >&2
+    agents_installed="none (MISSING — check $team_src)"
+  fi
+
+  # Always scaffold a logbook so the chronicler has a home.
+  if [ ! -f "$work_dir/DEVLOG.md" ] && [ -f "$support_dir/DEVLOG.template.md" ]; then
+    if cp "$support_dir/DEVLOG.template.md" "$work_dir/DEVLOG.md"; then
+      [ "$use_worktree" -eq 0 ] && devlog_scaffolded=1
+    fi
+  fi
+fi
+
+# ---- direnv: link, bless, and decide how to launch --------------------------
+setup_direnv
+
+# ---- Report ----------------------------------------------------------------
+echo "agent:         $agent" >&2
+if [ "$use_worktree" -eq 1 ]; then
+  echo "mode:          worktree (isolated)" >&2
+  echo "worktree:      $work_dir" >&2
+  echo "branch:        $branch" >&2
+  echo "base:          $base" >&2
+  echo "target branch: $target_branch" >&2
+else
+  echo "mode:          in place (no worktree)" >&2
+  echo "directory:     $work_dir" >&2
+  if [ -n "$repo" ]; then
+    echo "branch:        ${current_branch:-<detached HEAD>} @ ${start_sha:-<no commits>}" >&2
+  else
+    echo "branch:        <not a git repository — no commits will be made>" >&2
+  fi
+fi
+case "$agent" in
+  codex)
+    echo "model:         $CODEX_MODEL ($CODEX_EFFORT effort, $CODEX_TIER tier)" >&2
+    if [ -n "$CODEX_SEARCH" ] && [ "$CODEX_SEARCH" != "0" ]; then
+      echo "web search:    on (--search)" >&2
+    else
+      echo "web search:    off" >&2
+    fi
+    echo "autorun:       on, no Codex sandbox" >&2
+    ;;
+  claude)
+    echo "model:         $CLAUDE_MODEL (effort: ${CLAUDE_EFFORT:-from settings}, ultracode)" >&2
+    echo "settings:      ${CLAUDE_SETTING_SOURCES:-<claude default>} (user scope = ~/.claude/settings.json)" >&2
+    echo "autorun:       bypass permissions${CLAUDE_PERMISSION_MODE:+, falling back to --permission-mode $CLAUDE_PERMISSION_MODE}" >&2
+    ;;
+esac
+echo "team:          $agents_installed" >&2
+echo "direnv:        $direnv_note" >&2
+echo "commit signing: $gpg_sign_note" >&2
+if [ -n "$prompt" ]; then
+  echo "task:          runs your prompt immediately" >&2
+else
+  echo "task:          interactive (no prompt — you're dropped into the session)" >&2
+fi
+if [ -n "$pre_existing_changes" ]; then
+  echo >&2
+  echo "WARNING: the working tree already has uncommitted changes. The agent is told" >&2
+  echo "         to leave them alone, but it is working on your real branch — consider" >&2
+  echo "         committing or stashing first, or use '$invoked_as wt $agent ...'." >&2
+  echo >&2
+fi
+
+# ---- Build the guarded prompt ----------------------------------------------
+# Shared guardrails + logbook discipline. Commits are ALLOWED so the chronicler
+# can build a clean history; everything that rewrites or publishes history is not.
+if [ "$use_worktree" -eq 1 ]; then
+  read -r -d '' guard_scope <<EOF || true
+Work only inside this Git worktree:
+
+$work_dir
+
+Rules:
+- Stay inside this worktree. Do not edit files outside it.
+- You MAY (and should) commit on THIS worktree's branch at meaningful
+  milestones — distinct, reviewable chunks with clear messages. This is the
+  chronicler's responsibility; it builds a clean, legible git history.
+- Do NOT push, force-push, rebase, reset --hard, switch branches, merge into
+  other branches, or modify Git remotes/config.
+- A .envrc symlink may be present so that direnv hands you this project's
+  environment. It is scaffolding, not part of your work: never commit, edit or
+  delete it.
+- Do not install global packages.
+- Prefer minimal, reviewable changes. Run relevant local tests when practical.
+EOF
+
+  read -r -d '' guard_finish <<EOF || true
+When finished, your final response must include:
+1. A concise summary of all work completed.
+2. Tests/checks run, including anything that could not be run.
+3. The git log of this branch (so the history of chunks is visible).
+4. The exact commands to bring the committed work back into the regular branch:
+
+$merge_back
+
+   (If any changes remain uncommitted, commit them on "$branch" first.)
+EOF
+
+elif [ -n "$repo" ]; then
+  scaffold_dir=".claude/agents"
+  [ "$agent" = "codex" ] && scaffold_dir=".codex/agents"
+
+  dirty_rule=""
+  if [ -n "$pre_existing_changes" ]; then
+    dirty_rule="
+- The working tree ALREADY contains uncommitted changes that are not yours. Do
+  not commit, revert, stash, or \"clean up\" them. Leave them exactly as they are."
+  fi
+
+  read -r -d '' guard_scope <<EOF || true
+Work in this repository, in place:
+
+$work_dir
+
+You are NOT in a throwaway worktree. This is the user's real working copy, on
+the branch they are already on ("${current_branch:-detached HEAD}", at
+${start_sha:-no commits yet}). Be correspondingly careful.
+
+Rules:
+- Stay inside this directory. Do not edit files outside it.
+- You MAY (and should) commit on the CURRENT branch at meaningful milestones —
+  distinct, reviewable chunks with clear messages. This is the chronicler's
+  responsibility; it builds a clean, legible git history.
+- Commit only the files that are part of YOUR work. Never use "git add -A" or
+  "git commit -a" blindly: stage explicit paths.$dirty_rule
+- $scaffold_dir/ is a temporary scaffold for this session and is removed when
+  the session ends. Never commit it, and do not rely on it persisting.
+- Do NOT push, force-push, rebase, reset --hard, switch or create branches,
+  merge, stash, or modify Git remotes/config.
+- Do not install global packages.
+- Prefer minimal, reviewable changes. Run relevant local tests when practical.
+EOF
+
+  read -r -d '' guard_finish <<EOF || true
+When finished, your final response must include:
+1. A concise summary of all work completed.
+2. Tests/checks run, including anything that could not be run.
+3. The git log of the commits you made:  git log --oneline ${start_sha:-HEAD}..HEAD
+4. Anything you deliberately left uncommitted in the working tree, and why.
+EOF
+
+else
+  read -r -d '' guard_scope <<EOF || true
+Work in this directory, in place:
+
+$work_dir
+
+This is not a git repository, so there is no version-control safety net and no
+commits are possible. Be correspondingly careful.
+
+Rules:
+- Stay inside this directory. Do not edit files outside it.
+- Do not install global packages.
+- Prefer minimal, reviewable changes. Run relevant local tests when practical.
+EOF
+
+  read -r -d '' guard_finish <<EOF || true
+When finished, your final response must include:
+1. A concise summary of all work completed, file by file.
+2. Tests/checks run, including anything that could not be run.
+EOF
+fi
+
+read -r -d '' guard_common <<EOF || true
+$guard_scope
+
+Keep a development logbook at:
+
+$work_dir/DEVLOG.md
+
+For every feature or notable change, append an entry covering: WHAT changed,
+WHY (the key decision and the alternatives weighed), and HOW it was verified.
+
+$guard_finish
+EOF
+
+read -r -d '' guard_claude <<'EOF' || true
+You are operating in ULTRACODE mode at MAXIMUM effort: for any substantial
+work, drive a multi-agent workflow and adversarially verify before finalizing.
+
+You have a bundled team of subagents in .claude/agents/. Use them deliberately:
+- researcher       : ground the work in the codebase and any external
+                     docs/APIs BEFORE designing.
+- architect        : own the big-picture, elegant, simple, future-proof design.
+- precision-coder  : implement with rigor — types, correctness, efficiency,
+                     throughput, and idiomatic code quality.
+- test-engineer    : write and run tests; reproduce bugs; verify behavior.
+- security-auditor : hunt vulnerabilities, unsafe patterns, missing error
+                     handling, and edge cases.
+- critic           : run a SECOND, adversarial review loop over every plan and
+                     diff; demand improvements until the result is as good as
+                     it can be.
+- chronicler       : keep DEVLOG.md current (features + the reasons/decisions
+                     behind them), write/maintain feature docs, and COMMIT at
+                     each meaningful milestone with clear messages so the
+                     history reads as distinct chunks of work.
+
+Default loop per chunk of work:
+  research -> design (architect) -> implement (precision-coder) +
+  test (test-engineer) -> review (critic + security-auditor) -> revise ->
+  chronicler documents + commits.
+
+The chronicler step is MANDATORY, not optional: a chunk is NOT done until
+DEVLOG.md has an entry (what / why / how-verified) and the milestone is
+committed. Invoke the chronicler at every milestone — that is how the
+"always-on documentarian" runs within a single session.
+
+EOF
+
+read -r -d '' guard_codex <<'EOF' || true
+You have a bundled team of specialist SUBAGENTS defined in .codex/agents/
+(architect, precision-coder, critic, chronicler, test-engineer, researcher,
+security-auditor). Codex only spawns subagents when asked — so use them
+deliberately: spawn the right specialist(s) for each stage, in parallel where
+the work is independent, and consolidate their results.
+
+Default loop per chunk of work:
+  researcher (ground it) -> architect (design) -> precision-coder (implement) +
+  test-engineer (test) -> critic + security-auditor (adversarial review) ->
+  revise -> chronicler (document + commit).
+
+The chronicler is the ONLY committer and the sole writer of DEVLOG.md; its step
+is MANDATORY — a chunk is NOT done until DEVLOG.md has an entry (what / why /
+how-verified) and the milestone is committed. If subagent spawning is ever
+unavailable, embody each role yourself in the same order.
+
+EOF
+
+case "$agent" in
+  claude) guardrails="${guard_claude}
+${guard_common}" ;;
+  codex)  guardrails="${guard_codex}
+${guard_common}" ;;
+esac
+
+# With a prompt, append it as the initial task turn; without one, the guardrails
+# become session context (Claude: --append-system-prompt) and the session waits.
+guarded_prompt=""
+if [ -n "$prompt" ]; then
+  guarded_prompt="${guardrails}
+
+Task:
+${prompt}"
+fi
+
+# ---- Launch the agent ------------------------------------------------------
+# Claude's working directory is set solely by this cd; Codex also gets -C.
+cd "$work_dir"
+launch_status=0
+case "$agent" in
+  codex)
+    codex_args=(
+      -C "$work_dir"
+      -m "$CODEX_MODEL"
+      -c "model_reasoning_effort=\"$CODEX_EFFORT\""
+      -c "service_tier=\"$CODEX_TIER\""
+      -c "projects.\"$work_dir\".trust_level=\"trusted\""
+      --dangerously-bypass-approvals-and-sandbox
+    )
+    if [ -n "$CODEX_SEARCH" ] && [ "$CODEX_SEARCH" != "0" ]; then
+      codex_args+=(--search)
+    fi
+    # Codex names sessions from inside the TUI (/name), not from the command
+    # line, so --name cannot be forwarded. Under 'wt' it still named the branch
+    # and directory; say so only when it would otherwise look ignored.
+    if [ -n "$name" ] && [ "$use_worktree" -eq 0 ]; then
+      echo "note: codex has no launch-time session name — use /name \"$name\" in-session." >&2
+    fi
+    if [ -n "$prompt" ]; then
+      ${direnv_launch[@]+"${direnv_launch[@]}"} codex "${codex_args[@]}" "$guarded_prompt" || launch_status=$?
+    else
+      # No prompt: drop into an interactive Codex session. The installed
+      # .codex/agents each carry the scope/commit rules, so the team behaves
+      # correctly when spawned. (Codex has no additive system-prompt flag, so
+      # the top-level loop directive is not preloaded in this mode.)
+      ${direnv_launch[@]+"${direnv_launch[@]}"} codex "${codex_args[@]}" || launch_status=$?
+    fi
+    ;;
+  claude)
+    # Autorun stack, most permissive first. --allow-dangerously-skip-permissions
+    # makes the bypass mode available, --dangerously-skip-permissions asks for it,
+    # and --permission-mode is the fallback Claude uses if bypass is vetoed.
+    # Build the rest so an empty effort / mode / setting-sources omits the flag.
+    claude_args=(
+      --model "$CLAUDE_MODEL"
+      --allow-dangerously-skip-permissions
+      --dangerously-skip-permissions
+    )
+    if [ -n "$CLAUDE_PERMISSION_MODE" ]; then
+      claude_args+=(--permission-mode "$CLAUDE_PERMISSION_MODE")
+    fi
+    if [ -n "$CLAUDE_EFFORT" ]; then
+      claude_args+=(--effort "$CLAUDE_EFFORT")
+    fi
+    if [ -n "$CLAUDE_SETTING_SOURCES" ]; then
+      claude_args+=(--setting-sources "$CLAUDE_SETTING_SOURCES")
+    fi
+    # Session label. Claude shows it in the prompt box, /resume picker and
+    # terminal title. Probed rather than assumed so an older CLI degrades to a
+    # note instead of refusing to start; the probe only runs when a name is set.
+    # It goes through the SAME launcher prefix as the real run, because under
+    # `direnv exec` the project's .envrc can put a different claude on PATH — and
+    # probing one binary while launching another is how you get a flag that only
+    # explodes at launch. The pattern is anchored so a future --name-* flag
+    # cannot false-positive.
+    if [ -n "$name" ]; then
+      claude_help=""
+      probe_rc=0
+      claude_help="$(${direnv_launch[@]+"${direnv_launch[@]}"} claude --help 2>/dev/null)" || probe_rc=$?
+      if [ "$probe_rc" -eq 127 ]; then
+        echo "note: 'claude' was not found on PATH — the launch below will say so." >&2
+      elif printf '%s' "$claude_help" | grep -qE -- '(^|[[:space:],])--name([[:space:],=]|$)'; then
+        claude_args+=(--name "$name")
+      else
+        echo "note: this claude CLI has no --name flag; the session will be auto-named." >&2
+      fi
+    fi
+    if [ -n "$prompt" ]; then
+      ${direnv_launch[@]+"${direnv_launch[@]}"} claude "${claude_args[@]}" "$guarded_prompt" || launch_status=$?
+    else
+      # No prompt: drop into an interactive Claude session with the guardrails +
+      # team directive in the system prompt, so you can /effort, /model, etc.,
+      # then type your task.
+      ${direnv_launch[@]+"${direnv_launch[@]}"} claude "${claude_args[@]}" --append-system-prompt "$guardrails" || launch_status=$?
+    fi
+    ;;
+esac
+
+# ---- Post-run instructions -------------------------------------------------
+if [ "$use_worktree" -eq 1 ]; then
+  cat >&2 <<EOF
+
+${agent} session finished.
+
+Review the work in the worktree:
+  cd "$work_dir"
+  git status --short
+  git log --oneline "$base..$branch"
+
+Bring the committed work back to the regular branch:
+$merge_back
+EOF
+elif [ -n "$repo" ]; then
+  cat >&2 <<EOF
+
+${agent} session finished — work is already on branch "${current_branch:-<detached HEAD>}".
+
+Review what changed:
+  cd "$work_dir"
+  git status --short
+  git log --oneline ${start_sha:-HEAD}..HEAD
+  git diff ${start_sha:-HEAD}
+EOF
+else
+  cat >&2 <<EOF
+
+${agent} session finished in "$work_dir" (not a git repository — no commits made).
+EOF
+fi
+
+exit "$launch_status"
