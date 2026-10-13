@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Test harness for ~/.local/bin/ai — direnv integration, worktree anchoring, --name.
+# Test harness for the `ai` launcher — direnv integration, worktree anchoring, --name.
 #
 #   agent.d/tests/direnv-worktree.sh          # run everything
 #   AI_TEST_ROOT=/some/dir  ...               # keep the fixtures for inspection
+#   AI=/path/to/ai          ...               # test a launcher somewhere else
+#
+# The launcher under test is found relative to THIS file, so the suite works from
+# a git clone, from an installed prefix, and from a copy in any other location.
 #
 # Nothing outside $ROOT is touched: direnv's trust store is redirected via
 # XDG_DATA_HOME (essential — allow tokens are keyed on path+contents, so tokens
@@ -13,7 +17,23 @@
 # so we can assert without launching a real agent.
 set -uo pipefail
 
-AI=/home/naumitch/.local/bin/ai
+# Locate the launcher relative to this harness rather than hard-coding a path, so
+# the suite is as relocatable as the tool it tests. Two candidates cover both
+# layouts: <root>/bin/ai (the packaged/installed one) and <root>/ai (a launcher
+# sitting directly beside its agent.d/). An explicit AI= overrides both.
+here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd -P "$here/../.." && pwd)"
+if [ -z "${AI:-}" ]; then
+  for _c in "$root/bin/ai" "$root/ai"; do
+    [ -x "$_c" ] && { AI="$_c"; break; }
+  done
+fi
+if [ -z "${AI:-}" ] || [ ! -x "$AI" ]; then
+  echo "Cannot find the 'ai' launcher (looked in $root/bin and $root)." >&2
+  echo "Run the suite from its package, or set AI=/path/to/ai." >&2
+  exit 2
+fi
+
 # Scratch area: everything this suite creates lives here and nowhere else.
 ROOT="${AI_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ai-tests-XXXXXX")}"
 WORK="$ROOT/work"
