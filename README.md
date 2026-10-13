@@ -4,25 +4,33 @@ Run **Claude Code** or **OpenAI Codex** in full-auto mode with a bundled team of
 seven specialist subagents — either **in place** on your current branch, or
 inside a throwaway **git worktree**.
 
+**Codex defaults to `gpt-6-astra` at `ultra` effort.** Use `codex-wt` or
+`ai wt codex` to launch it in a fresh worktree; `ai codex` runs on your current
+branch. Claude remains the default agent.
+
 Launch command:
 ```bash
 usage:
-  ai [wt] [claude|codex] [options] [--] [prompt...]
+  ai [wt|here] [claude|codex] [options] [--] [prompt...]
   ai worktrees [--fix]
 ```
 
-EXamples:
+Examples:
 ```bash
 ai                                                    # in place, into session waiting for prompt
 ai wt                                                 # new git worktree
 ai          "Add a rate limiter to the API gateway"   # in place, current branch
 ai wt       "Refactor the scheduler to use asyncio"   # isolated worktree + branch
-ai    codex "Fix the failing auth test"               # same, with Codex
+ai    codex "Fix the failing auth test"               # in place, GPT-6 Astra, ultra
+ai wt codex "Refactor the auth flow"                  # Codex in a new worktree
 ai worktrees                                          # audit this repo's worktrees
 ```
 
-All of these will use the newest model, maximum reasoning effort, no approval prompts, and a
-logbook/commit discipline that leaves a clean git history behind.
+These launch with maximum configured reasoning effort, no approval prompts, and
+a logbook/commit discipline. Codex's model is explicitly `gpt-6-astra`; future
+model releases do not silently change that choice. The Codex launch contract
+was checked against CLI **0.154.0**, the September 9, 2026 release listed in
+the [official changelog](https://learn.chatgpt.com/docs/changelog).
 
 Use `ai --help` for full list of options.
 
@@ -64,7 +72,7 @@ and tells you what is missing.
 | **bash** | 4 or newer |
 | **git** | **2.31 or newer** — the launcher uses `git rev-parse --path-format=absolute` |
 | **claude** and/or **codex** | at least one CLI on your `PATH` |
-| `python3` | *optional* — lets Codex pick the newest model from its own catalogue |
+| `python3` | *optional for launching* — reads the selected Codex model's supported effort; required by the Codex regression suite |
 | `direnv` | *optional* — lets worktree sessions inherit your project environment |
 | git `user.name` / `user.email` | set globally; the chronicler agent commits |
 
@@ -140,12 +148,13 @@ The installer reports this; it never edits your Claude or Codex config.
 ## Usage
 
 ```
-ai [wt] [claude|codex] [options] [--] [prompt...]
+ai [wt|here] [claude|codex] [options] [--] [prompt...]
 ai worktrees [--fix]
 
 modes:
   (default)          work in place, on the current branch
   wt                 work in a fresh worktree + branch, then print the merge-back recipe
+  here               work in place, on the current branch
   worktrees          audit this repo's worktrees + direnv (runs no agent)
 
 options:
@@ -166,7 +175,9 @@ everything already configured.
 ## The team
 
 Installed into each session as real subagents — `.claude/agents/*.md` for
-Claude, `.codex/agents/*.toml` for Codex.
+Claude, `.codex/agents/*.toml` for Codex. Codex receives the workflow through
+`developer_instructions` and enables `multi_agent`, including when launched
+without an initial prompt.
 
 | Agent | Role |
 |---|---|
@@ -198,10 +209,12 @@ time beyond the four questions.
 | `AGENT_CLAUDE_MODEL` | `opus` (alias → latest Opus; `claude-opus-5[1m]` for 1M context) |
 | `AGENT_CLAUDE_EFFORT` | `max` (empty inherits `effortLevel` from your settings) |
 | `AGENT_CLAUDE_PERMISSION_MODE` | `dontAsk` |
-| `AGENT_CODEX_MODEL` / `AGENT_CODEX_EFFORT` | newest in Codex's own catalogue, at its highest effort |
+| `AGENT_CODEX_MODEL` | `gpt-6-astra`, independent of cache ranking |
+| `AGENT_CODEX_EFFORT` | selected model's highest advertised effort; Astra fallback is `ultra` |
+| `AGENT_CODEX_TIER` | `fast` (empty omits the override and inherits Codex config) |
 | `AGENT_WORKTREE_DIR` | `<main-repo-parent>/<main-repo>.worktrees` |
 | `AGENT_DIRENV` | `1` (`0` disables direnv integration entirely) |
-| `AGENT_NO_AGENTS` | `0` (`1` skips installing the subagent team) |
+| `AGENT_NO_AGENTS` | `0` (`1` skips the bundled team, its directive, and Codex feature enabling) |
 | `AGENT_NO_GPG_SIGN` | `1` — commits unsigned, scoped to the run, so auto-commits never block on a passphrase |
 
 ```bash
@@ -215,15 +228,16 @@ The full table, with the reasoning behind each default, is in
 ## Tests
 
 ```bash
-agent.d/tests/direnv-worktree.sh     # 74 assertions
+agent.d/tests/codex-launch.sh       # offline; requires python3, bash and git
+agent.d/tests/direnv-worktree.sh    # also requires direnv
 ```
 
-Fake `claude`/`codex` binaries on `PATH` record their argv and the environment
-they inherited, so the suite asserts on *behaviour* rather than structure.
-Everything it creates lives under one scratch directory, and direnv's trust
-store is redirected via `XDG_DATA_HOME` so your real one is never touched. It
-finds the launcher relative to itself, so it runs from a clone, from an
-installed prefix, or anywhere else (`AI=/path/to/ai` overrides).
+Fake `claude`/`codex` binaries record launch arguments and environment in temporary
+git repositories. The Codex suite checks launch modes, model and effort
+selection, preloaded instructions, team discovery, and cleanup without making
+model requests. The direnv suite also redirects its trust store via
+`XDG_DATA_HOME`. Both find the launcher relative to themselves and accept
+`AI=/path/to/ai` to test another copy.
 
 ## Updating
 

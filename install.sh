@@ -180,9 +180,9 @@ elif [ "$have_codex" -eq 0 ]; then
 fi
 
 if command -v python3 >/dev/null 2>&1; then
-  ok "python3 $(python3 --version 2>&1 | awk '{print $2}')  (Codex model auto-detect)"
+  ok "python3 $(python3 --version 2>&1 | awk '{print $2}')  (Codex supported-effort detection)"
 else
-  warn "python3 not found — Codex falls back to a pinned model instead of reading its own catalogue."
+  warn "python3 not found — Codex uses known effort defaults (GPT-6 Astra: ultra) instead of its catalogue."
 fi
 
 if command -v direnv >/dev/null 2>&1; then
@@ -368,6 +368,7 @@ say "  Try it:"
 say "      $CMD --help"
 say "      $CMD \"Fix the failing test in tests/test_login.py\"     # in place, current branch"
 say "      $CMD wt \"Risky refactor\"                               # isolated worktree"
+say "      $CMD wt codex \"Fix the failing test\"                  # worktree, GPT-6 Astra, ultra"
 say ""
 say "  Manual:    $PREFIX/agent.d/README.md"
 say "  Uninstall: $PREFIX/uninstall.sh"

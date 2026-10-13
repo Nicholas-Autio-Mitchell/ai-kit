@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# codex-wt — run Codex (newest model, highest reasoning effort, fast tier,
+# codex-wt — run Codex (GPT-6 Astra, highest reasoning effort, fast tier,
 # full-auto) in an isolated git worktree. Thin wrapper around `ai`.
 #   codex-wt "..."   ==   ai wt codex "..."
 # For the same setup without a worktree, run:  ai codex "..."

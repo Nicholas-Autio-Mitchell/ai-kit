@@ -5,7 +5,7 @@ bundled **team of specialist subagents** — either **in place** on your current
 branch, or inside a throwaway **git worktree**.
 
 ```
-ai [wt] [claude|codex] [options] [--] [prompt...]
+ai [wt|here] [claude|codex] [options] [--] [prompt...]
 ```
 
 Both the mode and the agent are optional, so the shortest useful form is just:
@@ -13,12 +13,14 @@ Both the mode and the agent are optional, so the shortest useful form is just:
 ```
 ai          "Do the task"     # in place, current branch, Claude
 ai wt       "Do the task"     # isolated worktree + branch, Claude
-ai    codex "Do the task"     # in place, with Codex instead
+ai    codex "Do the task"     # in place, current branch, Codex
 ai wt codex "Do the task"     # isolated worktree + branch, with Codex
+ai here codex "Do the task"   # in place, current branch, Codex
 ```
 
-The only difference between the modes is isolation. Model, effort, auto-run,
-subagent team, and logbook discipline are identical.
+Both agents default to in-place mode. Explicit `wt` / `--wt` and `here` / `--here`
+select the mode for either agent. Model, effort, auto-run, subagent team, and
+logbook discipline are identical across modes.
 
 > **The command name is not fixed.** `install.sh` symlinks your chosen name at
 > the launcher, and the launcher resolves its own location through symlinks to
@@ -46,8 +48,7 @@ selects worktree mode; picking the *agent* takes an argument.
 
 ## What it does
 
-**In place (default)** — for the normal case where you just want the best
-possible agent working on what you're working on:
+**In place (`here`, default)** — work on the current branch:
 
 1. Resolves the **repository root** and stays on your **current branch**.
 2. Installs the **subagent team** and a `DEVLOG.md` scaffold **temporarily**,
@@ -57,7 +58,7 @@ possible agent working on what you're working on:
    milestones, never push/rebase/reset/switch branches, never touch the user's
    pre-existing uncommitted changes, stage explicit paths (never `git add -A`).
 
-**Worktree (`wt`)** — for risky or long-running work you want quarantined:
+**Worktree (`wt`)** — work in a separate directory and branch:
 
 1. Creates a fresh worktree + branch off `<base>` (default: your current branch,
    so the work fast-forwards straight back) under
@@ -193,7 +194,7 @@ direnv matches it as a raw string prefix, so `/x/wt` would also match `/x/wt-evi
 ### Tests
 
 ```
-agent.d/tests/direnv-worktree.sh        # 74 assertions
+agent.d/tests/direnv-worktree.sh        # requires direnv
 AI_TEST_ROOT=/tmp/keep agent.d/tests/direnv-worktree.sh   # keep fixtures to inspect
 AI=/path/to/ai         agent.d/tests/direnv-worktree.sh   # test a launcher elsewhere
 ```
@@ -248,27 +249,46 @@ whatever the main repo's `.envrc` currently contains, without checking that you
 had already allowed it. That is usually what you want in your own repository —
 just be aware it is the weaker of the two trust models.
 
-## The two agents (newest model, max effort, by default)
+## The two agents
 
 | Agent  | Model                       | Effort / mode              | Auto-run flag                                |
 |--------|-----------------------------|----------------------------|----------------------------------------------|
-| codex  | newest from Codex's catalogue (now `gpt-5.6-sol`) | that model's highest effort (now `ultra`), `fast` tier | `--dangerously-bypass-approvals-and-sandbox` |
+| codex  | `gpt-6-astra` | highest supported effort (`ultra`), `fast` tier | `--dangerously-bypass-approvals-and-sandbox` |
 | claude *(default)* | `opus` alias → latest Opus (now `claude-opus-5`) | `--effort max` (ultracode) | `--allow-dangerously-skip-permissions` + `--dangerously-skip-permissions` + `--permission-mode dontAsk` |
 
-**Neither default is version-pinned, so neither goes stale:**
+**Claude** is launched with the `opus` alias, which the CLI resolves to the
+current model in that family.
 
-- **Claude** is launched with the `opus` *alias*. The CLI resolves aliases
-  (`opus` / `sonnet` / `haiku` / `fable`) to the newest model in that family, so
-  an Opus 6 release is picked up with no edit here.
-- **Codex** has no such alias, so `ai` reads the model catalogue the Codex CLI
-  itself maintains at `$CODEX_HOME/models_cache.json` and takes the top-ranked
-  listed model (`priority` 1 = newest/best) plus **the highest reasoning effort
-  that model actually advertises**. If the cache is missing or `python3` is
-  unavailable it falls back to `gpt-5.6-sol` / `ultra`.
+**Codex** always defaults to `gpt-6-astra`, even if its model cache is absent,
+stale, or ranks another model first. Set `AGENT_CODEX_MODEL` to choose a different
+model explicitly. A model identifier still needs to be available to your account.
 
-  This also means an override picks the right effort automatically:
-  `AGENT_CODEX_MODEL=gpt-5.5` runs at `xhigh` (5.5 has no `ultra`), while
-  `gpt-5.6-luna` runs at `max`.
+When `AGENT_CODEX_EFFORT` is unset or empty, `ai` reads the selected model's
+supported efforts from `$CODEX_HOME/models_cache.json`
+(`~/.codex/models_cache.json` by default). It chooses the highest advertised level in this order:
+`ultra > max > xhigh > high > medium > low > minimal > none`. The cache is a
+local snapshot, so the launcher cannot guarantee compatibility with every future
+model or CLI release.
+
+If that model has no usable cache entry, or `python3` is unavailable, known
+defaults are `ultra` for `gpt-6-astra`, `gpt-5.6-sol` (also `gpt-5.6`), and
+`gpt-5.6-terra`, `max` for `gpt-5.6-luna`, and `xhigh` for `gpt-5.5`.
+For an unknown model without a
+usable catalogue entry, set `AGENT_CODEX_EFFORT` explicitly; the launcher stops
+with guidance instead of guessing. An explicit effort override takes precedence.
+
+The launch contract was checked against **Codex CLI 0.154.0**, listed in the
+[official September 9, 2026 changelog](https://learn.chatgpt.com/docs/changelog).
+That CLI's bundled catalogue and the local cache inspected on September 12,
+2026 advertise Astra `ultra` as maximum reasoning and delegation effort. The
+checks cover CLI argument parsing and assembled instructions, without sending
+an inference request.
+
+`AGENT_CODEX_TIER=fast` is the default. Set `AGENT_CODEX_TIER=` to omit the tier
+override and inherit your Codex configuration. This is useful when your account
+or deployment does not support fast mode; for example, the
+[Astra API EU data residency configuration](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra)
+does not support fast mode.
 
 Codex web search: Codex enables web search by default (cached mode) and defaults
 to **live** results under a full-access sandbox (which `ai` uses). `ai`
@@ -337,17 +357,18 @@ settings.
 ## Usage
 
 ```
-ai [wt] [claude|codex] [options] [--] [prompt...]
+ai [wt|here] [claude|codex] [options] [--] [prompt...]
 ai worktrees [--fix]
 
 modes:
   (default)          work in place, on the current branch
   wt                 work in a fresh worktree + branch
+  here               work in place, on the current branch
   worktrees          audit this repo's worktrees + direnv (no agent)
 
 agents:
   claude (default)   latest Opus, --effort max, ultracode
-  codex              newest Codex model at its highest reasoning effort
+  codex              GPT-6 Astra at its highest supported reasoning effort
 
 options:
   -a, --agent NAME   codex or claude (usually given as a bare word instead)
@@ -362,6 +383,7 @@ options:
 examples:
   ai "Add a rate limiter to the API gateway"
   ai codex "Fix the failing auth test"
+  ai codex --here "Explain the current auth flow"   # Codex on the current branch
   ai                            # no prompt: interactive session, best config
   ai -n auth-review "Why does login 500 on retry?"   # named, in place
   ai wt "Risky refactor of the scheduler"
@@ -384,11 +406,16 @@ starts with one of those words just needs quoting:
 ### No-prompt (interactive) mode
 
 Omit the prompt (`ai`, `ai codex`, `claude-wt`, …) and you are dropped into
-an **interactive session** with everything already configured — **Claude** with the
-guardrails preloaded via `--append-system-prompt` (so you can run `/effort`,
-`/model`, etc., then type your task); **Codex** bare, though its installed
-`.codex/agents` still carry the scope/commit rules. In worktree mode the worktree
-is named `session-<timestamp>` when no prompt or `--name` is given.
+an **interactive session** with everything already configured. Claude preloads
+guardrails via `--append-system-prompt`; Codex preloads them through the
+invocation's `-c developer_instructions=...` override. Codex receives the same
+workflow with or without an initial task. `codex-wt` or `ai wt codex` creates a
+worktree in both cases. The worktree is named `session-<timestamp>` when no
+prompt or `--name` is given.
+
+The Codex override replaces an existing `developer_instructions` config value
+for that invocation; project `AGENTS.md` files are still read normally. The
+launcher does not write this override to your Codex config.
 
 ### Naming a session
 
@@ -446,9 +473,13 @@ security-auditor → revise → chronicler (document + commit)`.
 - **Claude:** `.claude/agents/*.md` so it can delegate to them.
 - **Codex:** `.codex/agents/*.toml` (Codex's `multi_agent` feature). The launch
   marks the working root trusted (`-c projects."<dir>".trust_level="trusted"`) so
-  Codex loads its project `.codex/` layers, and the prompt tells Codex to spawn
-  the specialists (Codex spawns subagents only when asked). Spawned subagents
-  inherit the parent's model, effort, and full-auto sandbox override.
+  Codex loads its project `.codex/` layers. It also passes `--enable multi_agent`
+  and preloads a directive to spawn the specialists through
+  `developer_instructions`. Spawned subagents inherit the parent's model,
+  effort, and full-auto sandbox override.
+
+`AGENT_NO_AGENTS=1` skips installing the bundled team and omits its directive
+and the Codex feature-enabling flag. Existing Codex settings still apply.
 
 ## The logbook & git history
 
@@ -485,7 +516,7 @@ fallback shown above.
 
 ## Environment overrides
 
-Defaults are the "best" config; override only if needed. The legacy `AGENT_WT_*`
+Defaults favor maximum effort and unattended work. The legacy `AGENT_WT_*`
 names are still honored as fallbacks.
 
 | Variable                        | Default                                                                 |
@@ -494,14 +525,14 @@ names are still honored as fallbacks.
 | `AGENT_CLAUDE_EFFORT`           | `max` (set to `xhigh` if `max` overthinks; empty = inherit `effortLevel`)|
 | `AGENT_CLAUDE_PERMISSION_MODE`  | `dontAsk` — fallback autorun mode if bypass is vetoed (`acceptEdits`, `auto`, `bypassPermissions`, `dontAsk`, `plan`, `manual`; empty omits the flag) |
 | `AGENT_CLAUDE_SETTING_SOURCES`  | `user,project,local` (empty = Claude's default)                         |
-| `AGENT_CODEX_MODEL`             | top-ranked model in Codex's catalogue, else `gpt-5.6-sol`               |
-| `AGENT_CODEX_EFFORT`            | highest effort that model supports, else `ultra`                        |
-| `AGENT_CODEX_TIER`              | `fast`                                                                  |
+| `AGENT_CODEX_MODEL`             | `gpt-6-astra`, independent of cache ranking                            |
+| `AGENT_CODEX_EFFORT`            | highest advertised effort for the selected model; known fallback defaults above |
+| `AGENT_CODEX_TIER`              | `fast` (empty omits the override and inherits Codex config)            |
 | `AGENT_CODEX_SEARCH`            | `1`: force Codex live web search (`--search`); `0` omits the flag        |
 | `AGENT_WORKTREE_DIR`            | `<main-repo-parent>/<main-repo>.worktrees` (legacy `CODEX_WORKTREE_DIR` honored) |
 | `AGENT_DIRENV`                  | `1` — link + allow `.envrc` per worktree and launch under `direnv exec` (`0` disables) |
-| `AGENT_SUPPORT_DIR`             | `<dir-of-ai>/agent.d`                                                |
-| `AGENT_NO_AGENTS=1`             | skip installing the team                                                |
+| `AGENT_SUPPORT_DIR`             | `<dir-of-ai>/agent.d`, or `../agent.d` in the source clone              |
+| `AGENT_NO_AGENTS=1`             | skip the bundled team, its directive, and Codex feature enabling       |
 | `AGENT_NO_GPG_SIGN`             | `1` (default): commits unsigned, scoped to the run; `0` keeps signing    |
 
 ## Customizing the team
@@ -522,7 +553,7 @@ Installed payload — self-contained, versioned, and never on your `PATH`:
 
 ```
 <prefix>/                    # default: ${XDG_DATA_HOME:-~/.local/share}/ai-kit
-├── ai                       # main script (in-place by default, `wt` for a worktree)
+├── ai                       # in place by default; `wt` creates a worktree
 ├── agent-wt                 # wrapper -> ai wt
 ├── codex-wt                 # wrapper -> ai wt --agent codex
 ├── claude-wt                # wrapper -> ai wt --agent claude
@@ -539,7 +570,7 @@ Installed payload — self-contained, versioned, and never on your `PATH`:
     ├── codex-agents/        # 7 Codex subagents (.toml) -> .codex/agents/
     │   ├── architect.toml   precision-coder.toml   critic.toml   chronicler.toml
     │   └── test-engineer.toml   researcher.toml   security-auditor.toml
-    └── tests/               # the 74-assertion suite
+    └── tests/               # Codex launch and direnv regression suites
 ```
 
 Only symlinks land in a directory on your `PATH`:
@@ -552,8 +583,22 @@ Only symlinks land in a directory on your `PATH`:
 ```
 
 In the git repo the four scripts live under `bin/` instead of at the top level;
-`install.sh` flattens them into `<prefix>/` so `ai` finds `agent.d/` beside
-itself. That is the only difference between the two trees.
+the launcher finds the adjacent `../agent.d/`. `install.sh` flattens the scripts
+into `<prefix>/`, where `ai` finds `agent.d/` beside itself. Both layouts work
+without an `AGENT_SUPPORT_DIR` override.
+
+### Codex launch regression tests
+
+```bash
+agent.d/tests/codex-launch.sh
+AI=/path/to/ai agent.d/tests/codex-launch.sh
+```
+
+The suite uses Python's standard library, fake CLIs, and temporary git
+repositories. It checks default and explicit launch modes, model and effort
+selection with missing or stale caches, workflow instructions with and without
+a task, team discovery, and cleanup. It runs offline and makes no model requests.
+The separate direnv suite is described above.
 
 ## Requirements & safety
 
@@ -567,9 +612,10 @@ Linux only — developed and tested on Ubuntu. `install.sh` checks all of it.
   `--effort` / `--setting-sources` (Claude) and
   `--dangerously-bypass-approvals-and-sandbox` (Codex). Only `--name` is probed
   before use; the rest are passed unconditionally.
-- `python3` (optional): only used to read Codex's model catalogue; without it,
-  the pinned fallback model/effort is used. Note that a machine which has never
-  run `codex` has no catalogue yet, so the first run uses that fallback.
+- `python3` (optional for launching): reads supported effort from Codex's model
+  catalogue. Without it, or before the first cache exists, Astra still runs at
+  `ultra`; other models use the known defaults above or require an explicit
+  effort override. Python is required for the Codex regression suite.
 - `direnv` (optional): without it, worktree sessions simply run without the
   project environment and say so.
 - git `user.name` / `user.email` set globally — the chronicler commits.

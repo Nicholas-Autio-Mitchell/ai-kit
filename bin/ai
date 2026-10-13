@@ -16,12 +16,11 @@ set -euo pipefail
 # the cursor-agent installer owns ~/.local/bin/agent and recreates it on every
 # self-update, which would silently overwrite a script parked there.
 #
-# Both agents get the same treatment in spirit: newest model, maximum reasoning
+# Both agents get the same treatment in spirit: capable model, maximum reasoning
 # effort, no approval prompts, and a documentation/logbook discipline that
 # commits a clean git history.
 #
-#   Codex   -> newest model from Codex's own catalogue (~/.codex/models_cache.json,
-#              currently gpt-5.6-sol) at that model's highest reasoning effort
+#   Codex   -> gpt-6-astra at its highest advertised reasoning effort
 #              (currently "ultra"), fast service tier,
 #              --dangerously-bypass-approvals-and-sandbox
 #   Claude  -> the "opus" alias, i.e. whatever the latest Opus model is
@@ -30,9 +29,9 @@ set -euo pipefail
 #              --allow-dangerously-skip-permissions --dangerously-skip-permissions
 #              --permission-mode dontAsk
 #
-# Both defaults track the newest model automatically: Claude via its own
-# latest-model alias, Codex by reading the catalogue the CLI itself maintains.
-# Nothing here is version-pinned, so nothing here goes stale.
+# Claude follows its latest-model alias. Codex stays on Astra unless overridden;
+# its optional CLI catalogue determines the selected model's highest effort.
+# Compatibility verified with Codex CLI 0.154.0.
 #
 # Usage:
 #   ai [wt] [claude|codex] [options] [--] [prompt...]
@@ -65,13 +64,12 @@ set -euo pipefail
 #                           (default: user,project,local — which settings.json
 #                            scopes Claude loads; "user" includes
 #                            ~/.claude/settings.json. Empty = Claude's default.)
-#   AGENT_CODEX_MODEL       (default: newest listed model in Codex's model
-#                            catalogue, falling back to gpt-5.6-sol)
+#   AGENT_CODEX_MODEL       (default: gpt-6-astra, independent of cache ranking)
 #   AGENT_CODEX_EFFORT      (default: the highest effort that model supports,
-#                            falling back to ultra)
-#   AGENT_CODEX_TIER        (default: fast)
+#                            falling back to ultra for Astra)
+#   AGENT_CODEX_TIER        (default: fast; empty inherits Codex config)
 #   AGENT_CODEX_SEARCH      (default: 1 = enable live web search via --search;
-#                            set to 0 to disable)
+#                            set to 0 to inherit Codex's search configuration)
 #   AGENT_WORKTREE_DIR      (worktree mode; default:
 #                            <main-repo-parent>/<main-repo>.worktrees — always
 #                            anchored to the MAIN worktree, so running this from
@@ -149,8 +147,8 @@ EOF
   fi
 
   cat <<EOF
-$invoked_as — run an AI coding agent (Codex or Claude) in full-auto mode: newest
-model, maximum reasoning effort, no approval prompts, a bundled team of
+$invoked_as — run an AI coding agent (Codex or Claude) in full-auto mode: Astra
+or latest Opus, maximum reasoning effort, no approval prompts, a bundled team of
 specialist subagents, and a logbook/commit discipline that leaves clean history.
 
 usage:
@@ -182,8 +180,8 @@ agents:
                     orchestration, and the full autorun stack:
                     --allow-dangerously-skip-permissions
                     --dangerously-skip-permissions --permission-mode dontAsk.
-  codex             OpenAI Codex — newest model from Codex's own catalogue at
-                    that model's highest reasoning effort, fast tier, live web
+  codex             OpenAI Codex — GPT-6 Astra at its highest advertised
+                    reasoning effort (currently ultra), fast tier, live web
                     search, --dangerously-bypass-approvals-and-sandbox.
 
 options:
@@ -269,10 +267,10 @@ environment overrides (legacy AGENT_WT_* names still honored):
                                 vetoed (acceptEdits, auto, bypassPermissions,
                                 dontAsk, plan, manual; empty omits the flag)
   AGENT_CLAUDE_SETTING_SOURCES  user,project,local (empty = Claude's default)
-  AGENT_CODEX_MODEL             newest listed model in Codex's own catalogue,
-                                falling back to gpt-5.6-sol
-  AGENT_CODEX_EFFORT            highest effort that model supports, else ultra
-  AGENT_CODEX_TIER              fast
+  AGENT_CODEX_MODEL             gpt-6-astra
+  AGENT_CODEX_EFFORT            highest advertised effort; Astra fallback: ultra
+                                unknown models need a catalogue entry or override
+  AGENT_CODEX_TIER              fast (empty inherits Codex config)
   AGENT_CODEX_SEARCH            1 — force live web search (0 omits --search)
   AGENT_WORKTREE_DIR            <main-repo-parent>/<main-repo>.worktrees
   AGENT_DIRENV                  1 — link + allow .envrc in each worktree and
@@ -284,8 +282,11 @@ environment overrides (legacy AGENT_WT_* names still honored):
                                 (0 keeps your normal signing)
 
 notes:
-  * Neither model default is version-pinned, so neither goes stale: Claude uses
-    the 'opus' alias, and Codex reads the model catalogue its own CLI maintains.
+  * Claude uses the 'opus' alias. Codex defaults to Astra even with a missing
+    or stale model catalogue. The catalogue only supplies its reasoning levels.
+  * Codex preloads workflow instructions with -c developer_instructions in both
+    prompted and interactive sessions; this overrides that config field for the
+    invocation. Repository AGENTS.md instructions are still read.
   * If a Claude session still shows "manual" in the mode indicator, bypass was
     vetoed AND --permission-mode was dropped. Claude states the reason in-session
     — org policy, a settings 'disableBypassPermissionsMode', or a disclaimer not
@@ -359,6 +360,8 @@ support_dir="$(first_set AGENT_SUPPORT_DIR AGENT_WT_SUPPORT_DIR || true)"
 if [ -z "$support_dir" ]; then
   if [ -d "$script_dir/agent.d" ]; then
     support_dir="$script_dir/agent.d"
+  elif [ -d "$script_dir/../agent.d" ]; then
+    support_dir="$(cd "$script_dir/../agent.d" && pwd -P)" # source checkout
   else
     support_dir="$script_dir/agent-wt.d"   # legacy layout
   fi
@@ -381,51 +384,35 @@ CLAUDE_PERMISSION_MODE="$(first_defined AGENT_CLAUDE_PERMISSION_MODE AGENT_WT_CL
 CLAUDE_SETTING_SOURCES="$(first_defined AGENT_CLAUDE_SETTING_SOURCES AGENT_WT_CLAUDE_SETTING_SOURCES \
                           || printf 'user,project,local')"
 
-# Codex has no "latest" alias, but the CLI keeps a catalogue of the models your
-# account can use in $CODEX_HOME/models_cache.json, ranked by `priority` (1 =
-# newest/best). Read the top listed model and the highest reasoning effort it
-# supports, so this tracks new releases without editing the script. Falls back to
-# the known-good pinned values if the cache is missing or unreadable.
-codex_pick() {  # $1 = model override (may be empty); prints "<model>\n<effort>"
+# The requested default is Astra, even with an absent or stale CLI cache.
+# The cache is an optional capability hint for the SELECTED model, not a ranking
+# of model quality or a promise of account access. Never silently change models.
+codex_effort() {  # $1 = model; prints its highest advertised effort
   local cache="${CODEX_HOME:-$HOME/.codex}/models_cache.json"
   [ -r "$cache" ] || return 1
   command -v python3 >/dev/null 2>&1 || return 1
-  python3 - "$cache" "${1:-}" <<'PY' 2>/dev/null
+  python3 - "$cache" "$1" <<'PY' 2>/dev/null
 import json, sys
 
 try:
-    models = json.load(open(sys.argv[1])).get("models", [])
-except Exception:
-    sys.exit(1)
-
-override = sys.argv[2] if len(sys.argv) > 2 else ""
-if override:
-    chosen = next((m for m in models if m.get("slug") == override), None)
-else:
-    listed = [m for m in models
-              if m.get("visibility") == "list" and m.get("priority") is not None]
-    chosen = min(listed, key=lambda m: m["priority"], default=None)
-if chosen is None:
+    with open(sys.argv[1]) as cache:
+        models = json.load(cache).get("models", [])
+    chosen = next((m for m in models
+                   if isinstance(m, dict) and m.get("slug") == sys.argv[2]), None)
+    levels = chosen.get("supported_reasoning_levels", []) if chosen else []
+    supported = {e.get("effort") for e in levels if isinstance(e, dict)}
+except (OSError, ValueError, AttributeError, TypeError):
     sys.exit(1)
 
 # Best -> worst; the cache lists what each model actually supports.
-ranked = ["ultra", "max", "xhigh", "high", "medium", "low"]
-supported = {e.get("effort") for e in chosen.get("supported_reasoning_levels", [])}
-effort = next((e for e in ranked if e in supported), "")
-
-print(chosen.get("slug", ""))
-print(effort)
+ranked = ["ultra", "max", "xhigh", "high", "medium", "low", "minimal", "none"]
+print(next((e for e in ranked if e in supported), ""))
 PY
 }
 
-CODEX_MODEL="$(first_set AGENT_CODEX_MODEL AGENT_WT_CODEX_MODEL || true)"
-codex_picked="$(codex_pick "$CODEX_MODEL" || true)"
-[ -n "$CODEX_MODEL" ] || CODEX_MODEL="$(printf '%s' "$codex_picked" | sed -n 1p)"
-CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_MODEL="$(first_set AGENT_CODEX_MODEL AGENT_WT_CODEX_MODEL || printf 'gpt-6-astra')"
 CODEX_EFFORT="$(first_set AGENT_CODEX_EFFORT AGENT_WT_CODEX_EFFORT || true)"
-[ -n "$CODEX_EFFORT" ] || CODEX_EFFORT="$(printf '%s' "$codex_picked" | sed -n 2p)"
-CODEX_EFFORT="${CODEX_EFFORT:-ultra}"
-CODEX_TIER="$(first_set AGENT_CODEX_TIER AGENT_WT_CODEX_TIER || printf 'fast')"
+CODEX_TIER="$(first_defined AGENT_CODEX_TIER AGENT_WT_CODEX_TIER || printf 'fast')"
 # Explicit empty value also disables --search.
 CODEX_SEARCH="$(first_defined AGENT_CODEX_SEARCH AGENT_WT_CODEX_SEARCH || printf '1')"
 
@@ -512,6 +499,24 @@ case "$agent" in
   *) echo "Invalid agent: '$agent' (use codex or claude)." >&2; usage ;;
 esac
 
+# Resolve only for Codex launches: help, worktree audits, and Claude must work
+# even if a Codex override has no known capabilities.
+if [ "$agent" = codex ] && [ "$audit" -eq 0 ] && [ -z "$CODEX_EFFORT" ]; then
+  CODEX_EFFORT="$(codex_effort "$CODEX_MODEL" || true)"
+  if [ -z "$CODEX_EFFORT" ]; then
+    case "$CODEX_MODEL" in
+      gpt-6-astra|gpt-5.6-sol|gpt-5.6|gpt-5.6-terra) CODEX_EFFORT=ultra ;;
+      gpt-5.6-luna) CODEX_EFFORT=max ;;
+      gpt-5.5|gpt-5.3-codex-spark) CODEX_EFFORT=xhigh ;;
+      *)
+        echo "Cannot determine the highest reasoning effort for '$CODEX_MODEL'." >&2
+        echo "Set AGENT_CODEX_EFFORT explicitly, or refresh this model's Codex catalogue." >&2
+        exit 2
+        ;;
+    esac
+  fi
+fi
+
 # --base cuts a branch, so it is still worktree-only. --name is a session label
 # in both modes now, and only additionally names the branch under 'wt'.
 if [ "$use_worktree" -eq 0 ] && [ -n "$base" ]; then
@@ -531,7 +536,7 @@ prompt="$*"
 repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [ "$use_worktree" -eq 1 ] && [ -z "$repo" ]; then
   echo "Not inside a git repository (or it is bare); worktree mode needs one." >&2
-  echo "Run without 'wt' to work in place in the current directory." >&2
+  echo "Use '--here' to work in place in the current directory." >&2
   exit 1
 fi
 if [ "$audit" -eq 1 ] && [ -z "$repo" ]; then
@@ -1044,11 +1049,12 @@ if [ "$use_worktree" -eq 1 ]; then
   # directory and a branch, and an explicit --name goes through the same filter as
   # a prompt-derived one: a '/' would otherwise nest the worktree a level down,
   # and '..' would abort mid-run with a raw git "not a valid branch name".
+  # Git also forbids consecutive dots inside a ref, so collapse every dot run.
   slug="$(
     printf '%s' "${name:-$prompt}" |
       LC_ALL=C tr '[:upper:]' '[:lower:]' |
       LC_ALL=C tr -cs 'a-z0-9._-' '-' |
-      sed 's/--*/-/g' |
+      sed 's/--*/-/g; s/\.\.*/./g' |
       cut -c1-40 |
       sed 's/^[.-]*//; s/[.-]*$//'
   )"
@@ -1243,11 +1249,11 @@ else
 fi
 case "$agent" in
   codex)
-    echo "model:         $CODEX_MODEL ($CODEX_EFFORT effort, $CODEX_TIER tier)" >&2
+    echo "model:         $CODEX_MODEL ($CODEX_EFFORT effort, ${CODEX_TIER:-configured} tier)" >&2
     if [ -n "$CODEX_SEARCH" ] && [ "$CODEX_SEARCH" != "0" ]; then
       echo "web search:    on (--search)" >&2
     else
-      echo "web search:    off" >&2
+      echo "web search:    configured by Codex (--search omitted)" >&2
     fi
     echo "autorun:       on, no Codex sandbox" >&2
     ;;
@@ -1445,6 +1451,10 @@ ${guard_common}" ;;
 ${guard_common}" ;;
 esac
 
+if [ "$agent" = codex ] && [ "$no_agents" = 1 ]; then
+  guardrails="$guard_common"
+fi
+
 # With a prompt, append it as the initial task turn; without one, the guardrails
 # become session context (Claude: --append-system-prompt) and the session waits.
 guarded_prompt=""
@@ -1456,19 +1466,44 @@ ${prompt}"
 fi
 
 # ---- Launch the agent ------------------------------------------------------
+# Encode a TOML basic string, including paths with quotes/backslashes and the
+# multiline workflow. Do not interpolate raw values into Codex's -c assignments.
+toml_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  value="${value//$'\b'/\\b}"
+  value="${value//$'\f'/\\f}"
+  printf '"%s"' "$value"
+}
+
 # Claude's working directory is set solely by this cd; Codex also gets -C.
 cd "$work_dir"
 launch_status=0
 case "$agent" in
   codex)
+    codex_instructions="Follow the user's explicit task scope and instructions when they differ
+from this default workflow. For example, a request for review only or no commits
+overrides the implementation and commit steps below.
+
+$guardrails"
     codex_args=(
       -C "$work_dir"
       -m "$CODEX_MODEL"
-      -c "model_reasoning_effort=\"$CODEX_EFFORT\""
-      -c "service_tier=\"$CODEX_TIER\""
-      -c "projects.\"$work_dir\".trust_level=\"trusted\""
+      -c "model_reasoning_effort=$(toml_string "$CODEX_EFFORT")"
+      -c "projects.$(toml_string "$work_dir").trust_level=\"trusted\""
+      -c "developer_instructions=$(toml_string "$codex_instructions")"
       --dangerously-bypass-approvals-and-sandbox
     )
+    if [ -n "$CODEX_TIER" ]; then
+      codex_args+=(-c "service_tier=$(toml_string "$CODEX_TIER")")
+    fi
+    if [ "$no_agents" != 1 ]; then
+      codex_args+=(--enable multi_agent)
+    fi
     if [ -n "$CODEX_SEARCH" ] && [ "$CODEX_SEARCH" != "0" ]; then
       codex_args+=(--search)
     fi
@@ -1479,12 +1514,9 @@ case "$agent" in
       echo "note: codex has no launch-time session name — use /name \"$name\" in-session." >&2
     fi
     if [ -n "$prompt" ]; then
-      ${direnv_launch[@]+"${direnv_launch[@]}"} codex "${codex_args[@]}" "$guarded_prompt" || launch_status=$?
+      ${direnv_launch[@]+"${direnv_launch[@]}"} codex "${codex_args[@]}" -- "$prompt" || launch_status=$?
     else
-      # No prompt: drop into an interactive Codex session. The installed
-      # .codex/agents each carry the scope/commit rules, so the team behaves
-      # correctly when spawned. (Codex has no additive system-prompt flag, so
-      # the top-level loop directive is not preloaded in this mode.)
+      # No prompt: preload the same developer instructions and wait for input.
       ${direnv_launch[@]+"${direnv_launch[@]}"} codex "${codex_args[@]}" || launch_status=$?
     fi
     ;;
