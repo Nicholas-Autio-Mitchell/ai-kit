@@ -182,7 +182,7 @@ if [ "$have_codex"  -eq 1 ]; then ok "codex   $(codex  --version 2>/dev/null | h
 if [ "$have_claude" -eq 0 ] && [ "$have_codex" -eq 0 ]; then
   warn "neither 'claude' nor 'codex' is on your PATH — install at least one:"
   say  "      Claude Code: curl -fsSL https://claude.ai/install.sh | bash"
-  say  "      Codex:       npm i -g @openai/codex   (or: brew install codex)"
+  say  "      Codex:       npm i -g @openai/codex   (or: brew install --cask codex)"
   say  "    Installing anyway; the launcher will work once a CLI is present."
 elif [ "$have_claude" -eq 0 ]; then
   warn "'claude' not found — the default agent will not run. Use '<cmd> codex ...' or install Claude Code."
