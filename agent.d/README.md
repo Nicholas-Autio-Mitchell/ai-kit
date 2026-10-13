@@ -98,6 +98,23 @@ shared root is a reasonable variant — see the direnv whitelist note below.
 
 ## direnv
 
+`install.sh` ensures **direnv 2.33+** is available. It reuses existing Homebrew
+or system tools on macOS; if missing, it uses existing Homebrew to install
+`direnv`. Without Homebrew, install direnv manually and re-run the installer.
+On Linux it uses the first available system package manager: `apt-get`, `dnf`,
+`yum`, `pacman`, `zypper`, or `apk`. Installation failure or an unsupported/old
+version stops before replacing the ai-kit payload. Noninteractive sudo uses
+`-n`; authenticate with `sudo -v` first or install the dependency yourself.
+Homebrew itself and shell hooks are never installed automatically. Uninstalling
+ai-kit leaves direnv and its configuration intact.
+
+The launcher uses identical trust and execution rules on Linux and macOS.
+`direnv exec` works without a shell hook. Optional interactive-shell setup is
+[documented by direnv](https://direnv.net/docs/hook.html): add
+`eval "$(direnv hook zsh)"` to `~/.zshrc` or
+`eval "$(direnv hook bash)"` to `~/.bashrc`; for macOS Bash login shells, source
+`.bashrc` from `.bash_profile` too.
+
 A worktree is only useful if it resolves to the **same project environment** as
 the repository it was cut from. When the main worktree has an `.envrc`, every
 launch:
@@ -134,7 +151,7 @@ cosmetic:
 
 `direnv exec` only cleans the path (no symlink resolution), so the directory form
 is the one whose token `exec` actually looks up. Both are given the physical path
-via `readlink -f` so they cannot disagree.
+with `cd -P` and `pwd -P`, supported by both platforms, so they cannot disagree.
 
 (Allowing a worktree by hand works fine — `cd <worktree> && direnv allow` with no
 argument uses the current directory and hits the good case.)
@@ -153,7 +170,9 @@ argument uses the current directory and hits the good case.)
 
 Supporting details, each of which was a real bug caught in review:
 
-- Every direnv call runs with inherited `DIRENV_*` **scrubbed**. `direnv status
+- Every direnv call clears inherited **state** (`DIRENV_DIFF`, `DIRENV_DIR`,
+  `DIRENV_FILE`, `DIRENV_WATCHES`, `DIRENV_IN_ENVRC`) while preserving
+  `DIRENV_CONFIG`, `DIRENV_BASH`, and other configuration. `direnv status
   --json` reports the *caller's* `loadedRC` beside the directory's `foundRC`,
   each with its own `allowed` field — and since `ai` launches agents under
   `direnv exec`, it would otherwise poison its own children into treating any
@@ -166,8 +185,9 @@ Supporting details, each of which was a real bug caught in review:
   rules out a directory named `.envrc` — direnv skips those and keeps walking up,
   so `allow` would bless an *ancestor* — and a symlink to a FIFO, which can serve
   different bytes to the comparison and to `direnv allow`, and hangs both.
-- Probes run under `timeout`, so an `.envrc` that reads stdin cannot wedge the
-  launch.
+- Probes use a portable Bash watchdog with a 20-second limit and closed stdin.
+  It cleans up subprocesses on exit, so a hanging `.envrc` cannot wedge launch.
+  GNU `timeout` is not required on either platform.
 
 **What the claim does *not* cover.** It is about the `.envrc`'s *bytes*. Those
 bytes then run in a directory whose contents come from `<base>`, and `.envrc`
@@ -208,11 +228,12 @@ actually reach the agent process" — rather than on structure. That distinction
 caught the symlink trap above, which passed every structural check (symlink
 present, `direnv allow` exited 0) while being completely non-functional.
 
-It redirects direnv's trust store with `XDG_DATA_HOME`, which is not optional:
+It isolates Git configuration (including commit signing), direnv configuration
+with `XDG_CONFIG_HOME`, and the trust store with `XDG_DATA_HOME`:
 allow tokens are keyed on path **and** contents, so tokens left by a previous run
 silently pre-authorise the fixtures and the suite passes for the wrong reason.
 
-The security regressions it pins: inherited `DIRENV_*` cannot forge a blessing; a
+The security regressions it pins: inherited direnv state cannot forge a blessing; a
 FIFO or a directory named `.envrc` is refused without hanging; `-n` cannot inject
 into printed commands or escape the worktree root; `DEEP`/`STRAY` trees survive
 `--fix`; and `ai worktrees` executes no `.envrc` — that last one with a control
@@ -619,8 +640,9 @@ tools produce installation guidance. GNU coreutils are not required.
   catalogue. Without it, or before the first cache exists, Astra still runs at
   `ultra`; other models use the known defaults above or require an explicit
   effort override. Python is required for the Codex regression suite.
-- `direnv` (optional): without it, worktree sessions simply run without the
-  project environment and say so.
+- **direnv 2.33+**: the installer ensures this dependency is available. A direct
+  source-checkout launch without direnv reports that no environment was loaded.
+  `AGENT_DIRENV=0` remains an explicit per-run opt-out.
 - git `user.name` / `user.email` set globally — the chronicler commits.
 - **Credentials are per-machine and ship with nothing here.** Run `claude` then
   `/login`, and `codex login`, on each new machine.

@@ -23,6 +23,21 @@ set -uo pipefail
 # sitting directly beside its agent.d/). An explicit AI= overrides both.
 here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -P "$here/../.." && pwd)"
+if [ -f "$root/agent.d/lib/platform.sh" ]; then
+  . "$root/agent.d/lib/platform.sh"
+  ai_prefer_homebrew
+fi
+command -v direnv >/dev/null 2>&1 || {
+  echo "direnv is required; run ./install.sh to install it." >&2
+  exit 2
+}
+direnv_version="$(direnv version)"
+if ! [[ "$direnv_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] || \
+   [ "${BASH_REMATCH[1]:-0}" -lt 2 ] || \
+   { [ "${BASH_REMATCH[1]:-0}" -eq 2 ] && [ "${BASH_REMATCH[2]:-0}" -lt 33 ]; }; then
+  echo "direnv 2.33.0+ is required for these JSON status tests (found $direnv_version)." >&2
+  exit 2
+fi
 if [ -z "${AI:-}" ]; then
   for _c in "$root/bin/ai" "$root/ai"; do
     [ -x "$_c" ] && { AI="$_c"; break; }
@@ -36,6 +51,8 @@ fi
 
 # Scratch area: everything this suite creates lives here and nowhere else.
 ROOT="${AI_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ai-tests-XXXXXX")}"
+mkdir -p "$ROOT"
+ROOT="$(cd -P "$ROOT" && pwd -P)"
 WORK="$ROOT/work"
 FAKEBIN="$ROOT/fakebin"
 OUT="$ROOT/out"
@@ -45,7 +62,15 @@ OUT="$ROOT/out"
 # the fixtures. Point direnv at a per-run store: full isolation, and the user's
 # real ~/.local/share/direnv is never touched.
 export XDG_DATA_HOME="$ROOT/xdg"
-rm -rf "$XDG_DATA_HOME"; mkdir -p "$XDG_DATA_HOME"
+export XDG_CONFIG_HOME="$ROOT/config"
+export XDG_CACHE_HOME="$ROOT/cache"
+for _gv in ${!GIT_@}; do unset "$_gv"; done
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+for _dv in ${!DIRENV_@}; do unset "$_dv"; done
+for _av in ${!AGENT_@}; do unset "$_av"; done
+unset _dv _av _gv
+rm -rf "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
 
 pass=0; fail=0
 ok()   { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
@@ -58,6 +83,11 @@ have() { grep -qF -- "$2" "$1" 2>/dev/null; }
 
 setup_fakes() {
   rm -rf "$FAKEBIN"; mkdir -p "$FAKEBIN"
+  # Keep fake agents ahead of the user's Homebrew binaries on macOS.
+  cat > "$FAKEBIN/brew" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
   cat > "$FAKEBIN/claude" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--help" ]; then
@@ -90,6 +120,10 @@ EOF
   for a in "$@"; do echo "ARG:$a"; done
   echo "ARGV_END"
   echo "MARKER:${AI_TEST_MARKER:-<unset>}"
+  echo "CWD:$PWD"
+  echo "CONFIG:${AI_TEST_CONFIG_MARKER:-<unset>}"
+  echo "DIRENV_CONFIG:${DIRENV_CONFIG:-<unset>}"
+  echo "DIRENV_BASH:${DIRENV_BASH:-<unset>}"
 } > "$AI_TEST_OUT"
 exit 0
 EOF
@@ -104,6 +138,7 @@ make_repo() {
   git init -q "$dir"
   git -C "$dir" config user.email t@t
   git -C "$dir" config user.name t
+  git -C "$dir" config commit.gpgsign false
   echo seed > "$dir/seed.txt"
   git -C "$dir" add seed.txt
   git -C "$dir" commit -qm init
@@ -150,6 +185,25 @@ run_ai() {
        "$AI" "$@" ) >"$out.stdout" 2>"$out.stderr"
   echo $? > "$out.rc"
 }
+
+# Bound whole launcher processes, including any descendants, on macOS and Linux.
+# A timed-out process gets a nonzero status; callers must require success too.
+bounded() (
+  set -m
+  task_pid="" guard_pid=""
+  trap '
+    [ -z "$task_pid" ] || kill -KILL -- "-$task_pid" 2>/dev/null || true
+    [ -z "$guard_pid" ] || kill -KILL -- "-$guard_pid" 2>/dev/null || true
+    wait 2>/dev/null || true
+  ' EXIT
+  "$@" &
+  task_pid=$!
+  (sleep 60; kill -KILL -- "-$task_pid" 2>/dev/null || true) >/dev/null 2>&1 &
+  guard_pid=$!
+  rc=0
+  wait "$task_pid" 2>/dev/null || rc=$?
+  exit "$rc"
+)
 
 rm -rf "$WORK" "$OUT"; mkdir -p "$WORK" "$OUT"
 setup_fakes
@@ -410,14 +464,21 @@ R20="$(make_repo repo20 --envrc --allow)"
 run_ai "$R20" "$OUT/t20a" wt -n fifo "task"
 wt20="$(sed -n 's/^worktree: *//p' "$OUT/t20a.stderr")"
 rm -f "$wt20/.envrc"; mkfifo "$wt20/.envrc"                  # symlink-to-FIFO stand-in
-timeout 60 env PATH="$FAKEBIN:$PATH" AI_TEST_OUT="$OUT/t20" AGENT_NO_AGENTS=1 \
-  bash -c "cd '$wt20' && '$AI' worktrees" >"$OUT/t20.stdout" 2>&1
-[ $? -ne 124 ] && ok "a FIFO .envrc does not hang the audit" || bad "audit hung on a FIFO .envrc"
-rm -f "$wt20/.envrc"; mkdir "$wt20/.envrc"                   # directory named .envrc
-timeout 60 env PATH="$FAKEBIN:$PATH" AI_TEST_OUT="$OUT/t20b" AGENT_NO_AGENTS=1 \
-  bash -c "cd '$R20' && '$AI' worktrees --fix" >"$OUT/t20b.stdout" 2>&1
+bounded env PATH="$FAKEBIN:$PATH" AI_TEST_OUT="$OUT/t20" AGENT_NO_AGENTS=1 \
+  bash -c 'cd "$1" && "$2" worktrees' _ "$wt20" "$AI" >"$OUT/t20.stdout" 2>&1
 rc20=$?
-[ "$rc20" -ne 124 ] && ok "a directory named .envrc does not hang --fix" || bad "--fix hung"
+[ "$rc20" -eq 1 ] && have "$OUT/t20.stdout" "worktree root:" && have "$OUT/t20.stdout" "blocked" \
+  && ok "a FIFO .envrc does not hang the audit" || bad "audit failed or hung on a FIFO .envrc"
+bounded env PATH="$FAKEBIN:$PATH" AI_TEST_OUT="$OUT/t20launch" AGENT_NO_AGENTS=1 \
+  /bin/bash -c 'cd "$1" && "$2" codex "task"' _ "$wt20" "$AI" >"$OUT/t20launch.stdout" 2>"$OUT/t20launch.stderr"
+[ "$?" -eq 0 ] && have "$OUT/t20launch" "MARKER:<unset>" \
+  && ok "a FIFO .envrc still launches Codex without an environment" || bad "FIFO launch failed or hung"
+rm -f "$wt20/.envrc"; mkdir "$wt20/.envrc"                   # directory named .envrc
+bounded env PATH="$FAKEBIN:$PATH" AI_TEST_OUT="$OUT/t20b" AGENT_NO_AGENTS=1 \
+  bash -c 'cd "$1" && "$2" worktrees --fix' _ "$R20" "$AI" >"$OUT/t20b.stdout" 2>&1
+rc20=$?
+[ "$rc20" -eq 0 ] && have "$OUT/t20b.stdout" "worktree root:" \
+  && ok "a directory named .envrc does not hang --fix" || bad "--fix failed or hung"
 if ( cd "$wt20" && direnv status --json 2>/dev/null | grep -q '"allowed": 0' ); then
   bad "SECURITY: blessed an ancestor via a directory named .envrc"
 else
@@ -471,6 +532,67 @@ case "$wt23b" in
   "$WORK/repo23.worktrees/"*) ok "--name '../..' cannot escape the root" ;;
   *) bad "--name escaped the worktree root" "$wt23b" ;;
 esac
+
+echo
+echo "=== 24. Codex worktree commands: physical paths and system Bash ==="
+R24="$(make_repo 'project with spaces' --envrc --allow)"
+ln -s "$WORK" "$ROOT/linked projects"
+( cd "$ROOT/linked projects/project with spaces" \
+  && PATH="$FAKEBIN:$PATH" AI_TEST_OUT="$OUT/t24" AGENT_NO_AGENTS=1 \
+     /bin/bash "$AI" wt codex -n portable "task" ) >"$OUT/t24.stdout" 2>"$OUT/t24.stderr"
+rc24=$?
+wt24="$(sed -n 's/^worktree: *//p' "$OUT/t24.stderr")"
+[ "$rc24" -eq 0 ] && have "$OUT/t24" "MARKER:from-project with spaces" \
+  && ok "system Bash launches ai wt codex with direnv through a symlinked path" \
+  || bad "system Bash/symlinked path lost the Codex environment"
+have "$OUT/t24" "CWD:$wt24" && ok "Codex runs in the physical worktree" || bad "Codex cwd mismatch"
+codex_wt="$(dirname "$AI")/codex-wt"
+( cd "$ROOT/linked projects/project with spaces" \
+  && PATH="$FAKEBIN:$PATH" AI_TEST_OUT="$OUT/t24b" AGENT_NO_AGENTS=1 \
+     /bin/bash "$codex_wt" -n wrapper "task" ) >"$OUT/t24b.stdout" 2>"$OUT/t24b.stderr"
+[ "$?" -eq 0 ] && have "$OUT/t24b" "MARKER:from-project with spaces" \
+  && ok "codex-wt inherits the same direnv environment" || bad "codex-wt direnv launch failed"
+
+echo
+echo "=== 25. custom direnv configuration and Bash survive state scrubbing ==="
+R25="$(make_repo repo25 --envrc)"
+custom_config="$ROOT/custom direnv config"
+custom_bash="$ROOT/custom-bash"
+mkdir -p "$custom_config"
+printf '%s\n' 'export AI_TEST_CONFIG_MARKER=custom-config' > "$custom_config/direnvrc"
+cat > "$custom_bash" <<'EOF'
+#!/bin/sh
+exec /bin/bash "$@"
+EOF
+chmod +x "$custom_bash"
+DIRENV_CONFIG="$custom_config" DIRENV_BASH="$custom_bash" direnv allow "$R25"
+DIRENV_CONFIG="$custom_config" DIRENV_BASH="$custom_bash" \
+  run_ai "$R25" "$OUT/t25" wt codex -n configured "task"
+[ "$(cat "$OUT/t25.rc")" -eq 0 ] && have "$OUT/t25" "CONFIG:custom-config" \
+  && ok "the configured direnvrc reaches the agent" || bad "custom direnvrc was ignored"
+have "$OUT/t25" "DIRENV_CONFIG:$custom_config" && have "$OUT/t25" "DIRENV_BASH:$custom_bash" \
+  && ok "DIRENV_CONFIG and DIRENV_BASH are preserved" || bad "direnv configuration variables were scrubbed"
+
+echo
+echo "=== 26. a hanging .envrc is bounded without GNU timeout ==="
+R26="$(make_repo repo26)"
+cat > "$R26/.envrc" <<'EOF'
+echo "$$" > "$AI_TEST_HUNG_PID"
+trap '' TERM
+while :; do sleep 30; done
+EOF
+direnv allow "$R26"
+bounded env PATH="$FAKEBIN:$PATH" AI_TEST_OUT="$OUT/t26" AI_TEST_HUNG_PID="$OUT/hung.pid" AGENT_NO_AGENTS=1 \
+  /bin/bash -c 'cd "$1" && "$2" codex "task"' _ "$R26" "$AI" >"$OUT/t26.stdout" 2>"$OUT/t26.stderr"
+rc26=$?
+[ "$rc26" -eq 0 ] && have "$OUT/t26" "MARKER:<unset>" \
+  && have "$OUT/t26.stderr" "failed to evaluate" \
+  && ok "a hanging probe times out and the agent still launches" || bad "hanging probe failed to recover"
+if [ -f "$OUT/hung.pid" ] && ! kill -0 "$(cat "$OUT/hung.pid")" 2>/dev/null; then
+  ok "the timed-out .envrc leaves no running shell"
+else
+  bad "the timed-out .envrc process survived, or the timeout control never ran"
+fi
 
 echo
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

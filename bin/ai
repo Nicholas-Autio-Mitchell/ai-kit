@@ -356,6 +356,15 @@ while [ -h "$src" ]; do
   esac
 done
 script_dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+# Platform helpers belong to the package, independently of custom agent files.
+for _platform in "$script_dir/agent.d/lib/platform.sh" "$script_dir/../agent.d/lib/platform.sh"; do
+  if [ -f "$_platform" ]; then
+    . "$_platform"
+    ai_prefer_homebrew
+    break
+  fi
+done
+unset _platform
 support_dir="$(first_set AGENT_SUPPORT_DIR AGENT_WT_SUPPORT_DIR || true)"
 if [ -z "$support_dir" ]; then
   if [ -d "$script_dir/agent.d" ]; then
@@ -596,26 +605,53 @@ direnv_launch=()   # command prefix for the agent launch; empty = launch directl
 # direnv normalises paths inconsistently: `direnv allow` resolves symlinks, while
 # `direnv exec` only cleans the path. Feed both the PHYSICAL path so the token
 # `allow` writes is the one `exec` looks up.
-direnv_phys() { readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
+direnv_phys() { (cd -P -- "$1" 2>/dev/null && pwd -P); }
 
-# Any DIRENV_* variables we inherited describe the environment of whatever
-# launched US, not the directory we are asking about. That matters more than it
+# Direnv's inherited state describes the environment of whatever launched US,
+# not the directory we are asking about. That matters more than it
 # sounds: `direnv status --json` reports the caller's "loadedRC" right next to the
 # directory's "foundRC", each with its own "allowed" field, so a probe run from
 # inside any direnv-active shell — including the agent this script itself starts
 # under `direnv exec` — would otherwise see somebody else's allowed .envrc and
-# conclude that THIS one is allowed. Scrub the state from every direnv call.
+# conclude that THIS one is allowed. Scrub that state from every direnv call,
+# preserving configuration such as DIRENV_CONFIG and DIRENV_BASH.
 direnv_scrub=(env)
-for _dv in ${!DIRENV_@}; do direnv_scrub+=(-u "$_dv"); done
+for _dv in DIRENV_DIFF DIRENV_DIR DIRENV_FILE DIRENV_WATCHES DIRENV_IN_ENVRC; do
+  direnv_scrub+=(-u "$_dv")
+done
 unset _dv
 
 # direnv_run <args...> — direnv, scrubbed and on a clock. The timeout is not
 # belt-and-braces: an .envrc that reads stdin, or one symlinked to a FIFO with no
 # writer, hangs `allow`/`exec` indefinitely and the agent would never start. Only
 # the short-lived probes get it; the launch itself must be able to run for hours.
-direnv_timeout=()
-command -v timeout >/dev/null 2>&1 && direnv_timeout=(timeout 20)
-direnv_run() { "${direnv_timeout[@]+"${direnv_timeout[@]}"}" "${direnv_scrub[@]}" direnv "$@"; }
+# Bash job control gives each child its own process group, so cancellation also
+# reaches the .envrc's children. This works with macOS Bash 3.2 and requires no
+# GNU timeout. The watchdog and any surviving children are always reaped/killed.
+direnv_run() (
+  set -m
+  command_pid="" watchdog_pid=""
+  trap '
+    [ -z "$command_pid" ] || kill -KILL -- "-$command_pid" 2>/dev/null || true
+    [ -z "$watchdog_pid" ] || kill -KILL -- "-$watchdog_pid" 2>/dev/null || true
+    wait 2>/dev/null || true
+  ' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  "${direnv_scrub[@]}" direnv "$@" </dev/null &
+  command_pid=$!
+  (
+    sleep 20
+    kill -TERM -- "-$command_pid" 2>/dev/null || exit 0
+    sleep 1
+    kill -KILL -- "-$command_pid" 2>/dev/null || true
+  ) >/dev/null 2>&1 &
+  watchdog_pid=$!
+  status=0
+  wait "$command_pid" 2>/dev/null || status=$?
+  exit "$status"
+)
 
 # direnv_ok <dir> — true when direnv can RUN a command for <dir>: nothing is in
 # scope, or what is loads without error. `direnv exec` is the probe on purpose —
@@ -639,6 +675,9 @@ direnv_ok() { direnv_run exec "$(direnv_phys "$1")" true >/dev/null 2>&1; }
 # leaves it off, because inheriting an allowed parent .envrc is legitimate there.
 direnv_allowed() {
   local json found rcpath
+  # status may read/hash an .envrc too; reject FIFOs and directories before
+  # calling it, just as the trust-copy check does before allowing a file.
+  if [ -e "$1/.envrc" ] && [ ! -f "$1/.envrc" ]; then return 1; fi
   json="$( cd "$(direnv_phys "$1")" 2>/dev/null && direnv_run status --json 2>/dev/null )" || return 1
   case "$json" in *'"foundRC"'*) ;; *) return 1 ;; esac
   found="${json#*\"foundRC\"}"
@@ -684,7 +723,6 @@ link_envrc() {
 # <src>'s existing blessing may be extended to it? True for the symlink we create,
 # and for a byte-identical file (e.g. one a branch happens to have committed).
 envrc_trusted_copy() {
-  local a b
   # -f, not -e, and it is load-bearing on both sides. -f follows symlinks and is
   # true only for a REGULAR file, which rules out a directory named .envrc (direnv
   # skips those and keeps walking up, so `allow` would bless an ancestor while we
@@ -692,11 +730,8 @@ envrc_trusted_copy() {
   # `direnv allow` read the stream twice and can be served different bytes each
   # time — a deterministic version of the race below, and a hang besides).
   [ -f "$1" ] && [ -f "$2" ] || return 1
-  # Bind and require non-empty: two failed readlinks both print nothing, and
-  # comparing "" to "" would answer "same file" for two paths that do not exist.
-  a="$(readlink -f -- "$1" 2>/dev/null)" || a=""
-  b="$(readlink -f -- "$2" 2>/dev/null)" || b=""
-  [ -n "$a" ] && [ "$a" = "$b" ] && return 0
+  # Bash compares device/inode directly; this follows symlinks on both platforms.
+  [ "$1" -ef "$2" ] && return 0
   cmp -s "$1" "$2"
 }
 

@@ -1,0 +1,49 @@
+name: Linux and macOS
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Ubuntu 24.04 packages direnv 2.32, before the required JSON status API.
+      - name: Install current upstream direnv on Linux
+        if: runner.os == 'Linux'
+        shell: /bin/bash {0}
+        run: |
+          curl -fsSL https://direnv.net/install.sh -o "$RUNNER_TEMP/install-direnv.sh"
+          bash "$RUNNER_TEMP/install-direnv.sh"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install ai-kit and ensure direnv is available
+        shell: /bin/bash {0}
+        run: ./install.sh -y --prefix "$RUNNER_TEMP/ai-kit" --bin-dir "$RUNNER_TEMP/ai-bin" --name ai-test --shortcuts
+      - name: Test with the system Bash
+        shell: /bin/bash {0}
+        env:
+          INSTALL_TEST_BASH: /bin/bash
+          DEPENDENCY_TEST_BASH: /bin/bash
+        run: |
+          agent.d/tests/install.sh
+          agent.d/tests/dependencies.sh
+          agent.d/tests/codex-launch.sh
+          agent.d/tests/direnv-worktree.sh
+      - name: Test Homebrew Bash
+        if: runner.os == 'macOS'
+        shell: /bin/bash {0}
+        run: |
+          brew install bash
+          export INSTALL_TEST_BASH="$(brew --prefix)/bin/bash"
+          export DEPENDENCY_TEST_BASH="$INSTALL_TEST_BASH"
+          agent.d/tests/install.sh
+          agent.d/tests/dependencies.sh

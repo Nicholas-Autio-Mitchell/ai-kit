@@ -45,7 +45,9 @@ cd ai-kit
 ```
 
 The installer runs a preflight, asks **four** questions, and prints exactly what
-it did. Nothing is written outside the two directories you pick.
+it did. ai-kit files stay in the two directories you pick. If direnv is missing,
+the installer installs it through your package manager; uninstalling ai-kit
+leaves that shared dependency installed.
 
 ```
 Install directory for the tool itself?   [~/.local/share/ai-kit]
@@ -76,7 +78,7 @@ provides a required tool, installation stops with setup instructions.
 | **git** | **2.31 or newer** — the launcher uses `git rev-parse --path-format=absolute` |
 | **claude** and/or **codex** | at least one CLI on your `PATH` |
 | `python3` | *optional for launching* — reads the selected Codex model's supported effort; required by the Codex regression suite |
-| `direnv` | *optional* — lets worktree sessions inherit your project environment |
+| `direnv` | **2.33+** — installed automatically if missing; loads project environments |
 | git `user.name` / `user.email` | set globally; the chronicler agent commits |
 
 On macOS, install Git with `xcode-select --install`, or use `brew install git`.
@@ -87,6 +89,35 @@ Ubuntu, if git is older than 2.31:
 ```bash
 sudo add-apt-repository ppa:git-core/ppa && sudo apt update && sudo apt install git
 ```
+
+## direnv on Linux and macOS
+
+The installer reuses an existing direnv. On macOS it checks Homebrew tools first,
+then your system PATH. If neither provides direnv, it runs `brew install direnv`
+when Homebrew is available. It never bootstraps Homebrew; without it, the error
+explains how to install direnv yourself.
+
+On Linux it installs missing direnv using `apt-get`, `dnf`, `yum`, `pacman`,
+`zypper`, or `apk`. Package installation uses sudo when necessary. Interactive
+installs may ask for your sudo password; `-y` uses `sudo -n` and stops with an
+error if authentication is needed. Run `sudo -v` first, or install direnv
+manually. Older direnv versions need an upgrade; the installer requires 2.33+
+for [JSON status checks](https://direnv.net/CHANGELOG.html). If your distribution
+only packages an older release (for example, Ubuntu 24.04), install a current
+version using [direnv's installation instructions](https://direnv.net/docs/installation.html)
+before running the ai-kit installer.
+
+Both platforms use the same workflow: review the project's `.envrc`, run
+`direnv allow .` once, then launch `ai wt codex` or `codex-wt`. Existing trust
+propagates to the worktree and `direnv exec` supplies the agent's environment.
+Blocked or broken environments are reported; they are never silently allowed.
+Set `AGENT_DIRENV=0` to disable integration for a run.
+
+Shell hooks are unnecessary for ai-kit. For automatic environment changes in
+interactive terminals, follow the [direnv shell setup](https://direnv.net/docs/hook.html):
+add `eval "$(direnv hook zsh)"` to `~/.zshrc`, or
+`eval "$(direnv hook bash)"` to `~/.bashrc`. A macOS Bash login shell must also
+source `~/.bashrc` from `~/.bash_profile`. The installer leaves shell files alone.
 
 ## The install pattern
 
@@ -234,7 +265,8 @@ The full table, with the reasoning behind each default, is in
 ## Tests
 
 ```bash
-agent.d/tests/install.sh            # offline install/upgrade/uninstall coverage
+agent.d/tests/install.sh           # offline install/upgrade/uninstall coverage
+agent.d/tests/dependencies.sh      # offline package-manager and failure tests
 agent.d/tests/codex-launch.sh       # offline; requires python3, bash and git
 agent.d/tests/direnv-worktree.sh    # also requires direnv
 ```
@@ -244,7 +276,8 @@ git repositories. The Codex suite checks launch modes, model and effort
 selection, preloaded instructions, team discovery, and cleanup without making
 model requests. The direnv suite also redirects its trust store via
 `XDG_DATA_HOME`. Both find the launcher relative to themselves and accept
-`AI=/path/to/ai` to test another copy.
+`AI=/path/to/ai` to test another copy. CI runs these suites on Linux and macOS,
+including the system and Homebrew Bash on macOS.
 
 ## Updating
 

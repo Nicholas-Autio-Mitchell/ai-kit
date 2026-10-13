@@ -3,11 +3,12 @@ set -euo pipefail
 
 # uninstall.sh — remove an ai-kit installation, and only that.
 #
-# Everything install.sh created is listed in <prefix>/manifest. This script
+# The ai-kit payload and links are listed in <prefix>/manifest. This script
 # removes exactly those entries: each symlink is deleted only if it is still a
 # symlink pointing into the prefix, so a name you have since taken over with
 # your own tool is reported and left alone. Nothing outside the prefix and the
 # recorded links is ever touched.
+# direnv is a shared system dependency and is intentionally left installed.
 #
 # usage:
 #   ./uninstall.sh                 find the installation and remove it
@@ -139,5 +140,6 @@ ok "removed $PREFIX"
 say ""
 say "  Untouched, because they are yours and not ours:"
 say "    ~/.claude/  ~/.codex/   (agent settings and credentials)"
+say "    direnv and its configuration (shared system dependency)"
 say "    any DEVLOG.md or .claude/agents/ committed in your own repositories"
 say ""

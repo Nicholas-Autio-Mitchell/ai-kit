@@ -47,6 +47,7 @@ done
 REPO="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
 . "$REPO/agent.d/lib/paths.sh"
 . "$REPO/agent.d/lib/platform.sh"
+. "$REPO/agent.d/lib/dependencies.sh"
 ai_prefer_homebrew
 
 VERSION="$(cat "$REPO/VERSION" 2>/dev/null || echo unknown)"
@@ -78,8 +79,10 @@ options:
   -h, --help        this text
 
 Installs a self-contained payload under --prefix and a symlink to it in
---bin-dir. Nothing else is touched, and uninstall.sh removes exactly what
-was recorded in <prefix>/manifest.
+--bin-dir; uninstall.sh removes the files recorded in <prefix>/manifest.
+Missing direnv is installed with Homebrew on macOS or the system package
+manager on Linux. Homebrew itself is never
+installed automatically. Uninstall leaves direnv installed.
 EOF
 }
 
@@ -194,10 +197,9 @@ else
 fi
 
 if command -v direnv >/dev/null 2>&1; then
-  ok "direnv $(direnv version 2>/dev/null)  (worktrees inherit the project environment)"
+  say "  direnv found: $(command -v direnv) (verified before installing the payload)"
 else
-  warn "direnv not found — worktree sessions run without your project's environment."
-  say  "    Optional. On Ubuntu: sudo apt install direnv"
+  say "  direnv not found — it will be installed after destination checks."
 fi
 
 if git config --get user.email >/dev/null 2>&1 && git config --get user.name >/dev/null 2>&1; then
@@ -290,6 +292,8 @@ case "$PREFIX" in
   "/"|"$HOME"|"") die "refusing to use '$PREFIX' as the payload directory" ;;
 esac
 
+ai_install_direnv
+
 # Upgrade in place: clear only the payload we lay down, never the whole prefix,
 # so a manifest or anything else the user parked there survives.
 rm -rf -- "$PREFIX/agent.d"
@@ -351,7 +355,8 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ok "$BIN_DIR is on your PATH" ;;
   *)
     warn "$BIN_DIR is NOT on your PATH. Add it:"
-    case "${SHELL##*/}" in
+    login_shell="${SHELL:-}"
+    case "${login_shell##*/}" in
       zsh)  shell_rc="${ZDOTDIR:-$HOME}/.zshrc" ;;
       bash) if [ "$platform" = Darwin ]; then shell_rc="$HOME/.bash_profile"; else shell_rc="$HOME/.bashrc"; fi ;;
       *)    shell_rc="your shell's startup file" ;;
@@ -385,5 +390,7 @@ say "      $CMD wt \"Risky refactor\"                               # isolated w
 say "      $CMD wt codex \"Fix the failing test\"                  # worktree, GPT-6 Astra, ultra"
 say ""
 say "  Manual:    $PREFIX/agent.d/README.md"
+say "  direnv:    project environments load automatically; review .envrc, then run 'direnv allow .' once."
+say "             Shell hooks are optional for ai-kit; see the manual for bash/zsh setup."
 say "  Uninstall: $PREFIX/uninstall.sh"
 say ""

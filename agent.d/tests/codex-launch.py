@@ -106,6 +106,10 @@ class CodexLaunchTests(unittest.TestCase):
         fake = self.fakebin / "codex"
         fake.write_text("#!" + sys.executable + "\n" + FAKE_CODEX)
         fake.chmod(0o755)
+        # Homebrew discovery must not prepend real agent binaries to fake PATH.
+        brew = self.fakebin / "brew"
+        brew.write_text("#!" + sys.executable + "\nimport sys\nsys.exit(1)\n")
+        brew.chmod(0o755)
         # These are child-process configuration overrides; the running test's
         # own HOME and CODEX_HOME, and the user's files, are never changed.
         self.env = {
