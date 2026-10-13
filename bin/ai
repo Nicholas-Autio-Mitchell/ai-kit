@@ -1,348 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ai — run an AI coding agent (Codex or Claude) in full-auto mode with a
-# bundled team of specialist subagents, either IN PLACE on your current branch
-# or inside a throwaway git worktree.
+# ai — run Claude or Codex autonomously, with a team of seven subagents, in
+# place on the current branch or on a new branch in its own git worktree.
 #
-#   ai          "Do the task"     # in place, on the current branch (Claude)
-#   ai wt       "Do the task"     # isolated worktree + branch (Claude)
-#   ai    codex "Do the task"     # in place, with Codex instead
-#   ai wt codex "Do the task"     # isolated worktree + branch, with Codex
-#
-# The command name is chosen at install time (install.sh --name) and reached
-# through a symlink; this script resolves that symlink to find agent.d/ beside
-# itself, so any name works. "agent" is the one name deliberately not offered:
-# the cursor-agent installer owns ~/.local/bin/agent and recreates it on every
-# self-update, which would silently overwrite a script parked there.
-#
-# Both agents get the same treatment in spirit: capable model, maximum reasoning
-# effort, no approval prompts, and a documentation/logbook discipline that
-# commits a clean git history.
-#
-#   Codex   -> gpt-6-astra at its highest advertised reasoning effort
-#              (currently "ultra"), fast service tier,
-#              --dangerously-bypass-approvals-and-sandbox
-#   Claude  -> the "opus" alias, i.e. whatever the latest Opus model is
-#              (currently claude-opus-5), --effort max ("ultracode"
-#              orchestration), and the full autorun stack:
-#              --allow-dangerously-skip-permissions --dangerously-skip-permissions
-#              --permission-mode dontAsk
-#
-# Claude follows its latest-model alias. Codex stays on Astra unless overridden;
-# its optional CLI catalogue determines the selected model's highest effort.
-# Compatibility verified with Codex CLI 0.154.0.
-#
-# Usage:
-#   ai [wt] [claude|codex] [options] [--] [prompt...]
-#
-# The agent name is optional and defaults to claude.
-#
-# Convenience wrappers (worktree mode, same options):
-#   agent-wt  "..."  ==  ai wt "..."
-#   codex-wt  "..."  ==  ai wt codex  "..."
-#   claude-wt "..."  ==  ai wt claude "..."
-#
-# Environment overrides (rarely needed; defaults are the "best" config).
-# The legacy AGENT_WT_* names are still honored as fallbacks.
-#   AGENT_CLAUDE_MODEL      (default: opus — alias for the latest Opus model.
-#                            Set to claude-opus-5[1m] for the 1M-token context,
-#                            or to sonnet / haiku for a cheaper run.)
-#   AGENT_CLAUDE_EFFORT     (default: max; set to xhigh if max overthinks, or
-#                            empty to inherit effortLevel from your settings.json)
-#   AGENT_CLAUDE_PERMISSION_MODE
-#                           (default: dontAsk — the fallback autorun mode. Claude
-#                            prefers bypassPermissions from
-#                            --dangerously-skip-permissions, but that one mode can
-#                            be vetoed by org policy / settings / an unaccepted
-#                            disclaimer, in which case the session silently drops
-#                            to "manual". --permission-mode is NOT subject to that
-#                            veto, so it keeps the session unattended. Valid:
-#                            acceptEdits, auto, bypassPermissions, dontAsk, plan,
-#                            manual. Empty = omit the flag.)
-#   AGENT_CLAUDE_SETTING_SOURCES
-#                           (default: user,project,local — which settings.json
-#                            scopes Claude loads; "user" includes
-#                            ~/.claude/settings.json. Empty = Claude's default.)
-#   AGENT_CODEX_MODEL       (default: gpt-6-astra, independent of cache ranking)
-#   AGENT_CODEX_EFFORT      (default: the highest effort that model supports,
-#                            falling back to ultra for Astra)
-#   AGENT_CODEX_TIER        (default: fast; empty inherits Codex config)
-#   AGENT_CODEX_SEARCH      (default: 1 = enable live web search via --search;
-#                            set to 0 to inherit Codex's search configuration)
-#   AGENT_WORKTREE_DIR      (worktree mode; default:
-#                            <main-repo-parent>/<main-repo>.worktrees — always
-#                            anchored to the MAIN worktree, so running this from
-#                            inside a worktree no longer nests another
-#                            .worktrees/ directory underneath it)
-#                           (legacy AGENT_WT_WORKTREE_DIR / CODEX_WORKTREE_DIR honored)
-#   AGENT_DIRENV            (default: 1 = integrate with direnv when it is
-#                            installed. See "direnv" below. 0 disables all of it.)
-#   AGENT_SUPPORT_DIR       (default: <dir-of-this-script>/agent.d)
-#   AGENT_NO_AGENTS=1       (skip installing the bundled subagent team)
-#   AGENT_NO_GPG_SIGN       (default 1 = commits are NOT signed, so the
-#                            chronicler's auto-commits never block on a GPG
-#                            passphrase. Set to 0 to keep your normal signing.
-#                            Scoped to this run via GIT_CONFIG_* env vars —
-#                            your repo's git config is never modified.)
-#
-# direnv
-# ------
-# A worktree is only useful if it resolves to the SAME project environment as the
-# repository it was cut from. When the main worktree has an .envrc, every launch:
-#   1. symlinks that .envrc into the new worktree (so direnv finds one there),
-#   2. runs `direnv allow` on it, and
-#   3. launches the agent through `direnv exec`, so the AGENT process inherits
-#      the project's PATH/VIRTUAL_ENV — not just your interactive shells.
-#
-# Step 2 is needed per worktree because direnv keys its trust on
-# sha256(path + "\n" + contents): every worktree path needs its own blessing, and
-# editing the shared .envrc invalidates all of them at once. That is why this runs
-# on EVERY launch rather than only at creation — it self-heals.
-#
-# Trust is PROPAGATED, never created. A worktree's .envrc is only allowed when it
-# is a symlink to, or byte-identical with, an .envrc the main worktree has already
-# allowed. In place, `direnv allow` is never called at all — an unreviewed .envrc
-# is reported, not executed. Step 3 is skipped (with a reason) whenever direnv
-# cannot load the directory cleanly, so a blocked or broken .envrc downgrades to a
-# plain launch instead of failing to start the agent.
-#
-# Scope of that claim, precisely: it is about the .envrc's BYTES. Those bytes then
-# run in a directory whose contents come from <base>, and .envrc idioms are
-# directory-relative — `dotenv` reads the branch's .env, `PATH_add bin` puts the
-# branch's bin/ ahead of yours, `use flake` / `layout poetry` execute branch
-# content outright. So a worktree cut from a ref you do not trust can still
-# influence the environment through a trusted .envrc. This is inherent to direnv
-# plus worktrees, not specific to `ai` — but if you are reviewing someone else's
-# code (`ai wt --base origin/pr-1234 ...`), run it with AGENT_DIRENV=0.
-#
-# `ai worktrees` audits and repairs all of this for worktrees that already exist.
+#   ai [wt] [claude|codex] [-b REF] [-n NAME] [--] [prompt...]
+#   ai worktrees [--fix]
 
 # ---- How we were invoked (captured before symlink resolution) --------------
-# Anything named *-wt defaults to worktree mode, so the old wrappers keep their
-# behavior and `ln -s ai foo-wt` does the obvious thing.
 invoked_as="$(basename -- "${BASH_SOURCE[0]}")"
-case "$invoked_as" in
-  *-wt) use_worktree=1 ;;
-  *)    use_worktree=0 ;;
-esac
 
-# usage [exit-code] — a one-screen hint on error (stderr), the full manual on
-# explicit --help (stdout, so it pipes into less/grep).
+# usage [exit-code] — a short hint on error (stderr), the full help on --help
+# (stdout, so it pipes into less/grep).
 usage() {
   local code="${1:-2}"
 
   if [ "$code" -ne 0 ]; then
     cat >&2 <<EOF
-usage: $invoked_as [wt] [claude|codex] [options] [--] [prompt...]
+usage: $invoked_as [wt] [claude|codex] [-b REF] [-n NAME] [--] [prompt...]
        $invoked_as worktrees [--fix]
-
-  $invoked_as "Fix the failing auth test"     # in place, current branch, Claude
-  $invoked_as wt codex "Risky refactor"       # isolated worktree + branch, Codex
-  $invoked_as worktrees                       # audit this repo's worktrees + direnv
-
-Run '$invoked_as --help' for modes, options, examples, and environment overrides.
+Run '$invoked_as --help' for details.
 EOF
     exit "$code"
   fi
 
   cat <<EOF
-$invoked_as — run an AI coding agent (Codex or Claude) in full-auto mode: Astra
-or latest Opus, maximum reasoning effort, no approval prompts, a bundled team of
-specialist subagents, and a logbook/commit discipline that leaves clean history.
+$invoked_as: run Claude (default) or Codex autonomously with a team of seven subagents.
 
-usage:
-  $invoked_as [wt] [claude|codex] [options] [--] [prompt...]
-  $invoked_as worktrees [--fix]
-
-Both the mode and the agent are optional, so the shortest useful form is just
-"$invoked_as 'your task'" — in place, on your current branch, with Claude.
+usage: $invoked_as [wt] [claude|codex] [-b REF] [-n NAME] [--] [prompt...]
+       $invoked_as worktrees [--fix]
 
 modes:
-  (default)         IN PLACE. Runs at the repository root, on the branch you are
-                    already on. Your pre-existing uncommitted changes are left
-                    alone; the agent may commit its own work. The subagent team
-                    is installed temporarily, hidden from git status, and removed
-                    on exit — the repository is left exactly as it was found.
-
-  wt                WORKTREE. Cuts a fresh branch + worktree from <base> under
-                    <main-repo-parent>/<main-repo>.worktrees/ and works only
-                    there, then prints the merge-back recipe. Use it for anything
-                    risky, exploratory, long-running, or run in parallel.
-
-  worktrees         AUDIT. Lists every worktree of this repository with where it
-                    sits relative to the canonical root and what direnv makes of
-                    it, then prints the commands to fix anything off. Read-only
-                    unless you add --fix. Runs no agent.
-
-agents:
-  claude  (default) Claude Code — latest Opus, --effort max, ultracode
-                    orchestration, and the full autorun stack:
-                    --allow-dangerously-skip-permissions
-                    --dangerously-skip-permissions --permission-mode dontAsk.
-  codex             OpenAI Codex — GPT-6 Astra at its highest advertised
-                    reasoning effort (currently ultra), fast tier, live web
-                    search, --dangerously-bypass-approvals-and-sandbox.
+  (default)  work in place, on the current branch
+  wt         work on a new branch, in a new worktree under <repo>.worktrees/
+  worktrees  audit this repository's worktrees and direnv; --fix repairs them
 
 options:
-  -a, --agent NAME  Which agent to run: codex or claude. Usually given as a
-                    bare word instead; omit entirely for the claude default.
+  -b, --base REF   base of the worktree branch (default: the current branch)
+  -n, --name NAME  session name (Claude); with wt, also names the branch and worktree
+  -h, --help       show this help
 
-      --wt          Force worktree mode (same as the bare 'wt' word).
-      --here        Force in-place mode (useful for the *-wt wrappers).
+defaults:
+  claude opus, --effort max, permission prompts skipped (dontAsk fallback)
+  codex  gpt-6-astra, highest effort, fast tier, --search, no sandbox/approvals
+  team   architect, chronicler, critic, precision-coder, researcher,
+         security-auditor, test-engineer (temporary, hidden from git)
 
-  -b, --base REF    Worktree mode only. Base ref to branch from.
-                    Default: your current branch (so the work fast-forwards
-                    straight back), falling back to the repo's default branch.
-
-  -n, --name NAME   Session label, in BOTH modes. Claude shows it in the prompt
-                    box, the /resume picker, and the terminal title. In worktree
-                    mode it additionally names the branch and directory, where it
-                    defaults to a slug generated from the prompt. (Codex has no
-                    launch-time session name — use its /name command in-session.)
-
-      --fix         'worktrees' mode only. Actually apply the repairs it lists
-                    instead of only printing them.
-
-  -h, --help        Show this help.
+environment (with defaults):
+  AGENT_CLAUDE_MODEL            opus
+  AGENT_CLAUDE_EFFORT           max                 (empty: omit the flag)
+  AGENT_CLAUDE_PERMISSION_MODE  dontAsk             (empty: omit the flag)
+  AGENT_CLAUDE_SETTING_SOURCES  user,project,local  (empty: omit the flag)
+  AGENT_CODEX_MODEL             gpt-6-astra
+  AGENT_CODEX_EFFORT            the model's highest
+  AGENT_CODEX_TIER              fast                (empty: omit the flag)
+  AGENT_CODEX_SEARCH            1                   (0: omit --search)
+  AGENT_WORKTREE_DIR            <repo>.worktrees
+  AGENT_DIRENV                  1                   (0: never use direnv)
+  AGENT_SUPPORT_DIR             $support_dir
+  AGENT_NO_AGENTS               0                   (1: skip the team)
+  AGENT_NO_GPG_SIGN             1                   (0: keep commit signing)
 
 examples:
-  The everyday case — Claude, right here, on your current branch:
-    $invoked_as "Add a rate limiter to the API gateway"
-    $invoked_as "Fix the failing auth test in tests/test_login.py"
-
-  Same thing with Codex — name it right after the mode:
-    $invoked_as codex "Fix the failing auth test in tests/test_login.py"
-
-  Interactive — no prompt, drop into a fully configured session:
-    $invoked_as              # guardrails + team preloaded; then /effort, /model, or just type
-    $invoked_as codex
-
-  Isolated worktree for risky or long-running work:
-    $invoked_as wt "Refactor the scheduler to use asyncio"
-    $invoked_as wt codex "Migrate the config loader to pydantic v2"
-
-  Worktree off another base, with a chosen branch name:
-    $invoked_as wt codex --base release/1.2 -n auth-backport "Backport the auth fix"
-        -> branch codex/auth-backport-<timestamp>
-
-  Naming a session without cutting a worktree:
-    $invoked_as -n auth-review "Why does login 500 on retry?"
-        -> in place, but the session shows up as "auth-review" in /resume
-
-  Auditing and repairing this repository's worktrees (direnv included):
-    $invoked_as worktrees          # report only
-    $invoked_as worktrees --fix    # move stray trees, prune dead ones, re-link
-                                   # and re-allow .envrc
-
-  Equivalent wrappers (all worktree mode):
-    claude-wt "Add a rate limiter"             ==  $invoked_as wt claude "..."
-    codex-wt -n perf "Profile the hot loop"    ==  $invoked_as wt codex -n perf "..."
-    agent-wt --here "quick fix"                # force in-place from a *-wt wrapper
-
-  Tuning a single run:
-    AGENT_CLAUDE_MODEL='claude-opus-5[1m]' $invoked_as "Audit this monorepo"
-    AGENT_CLAUDE_MODEL=sonnet $invoked_as "Rename these variables"
-    AGENT_CLAUDE_EFFORT=xhigh $invoked_as "..."              # if max overthinks
-    AGENT_CLAUDE_EFFORT= $invoked_as "..."                   # inherit settings.json
-    AGENT_CODEX_MODEL=gpt-5.6-terra $invoked_as codex "..."  # effort follows the model
-    AGENT_NO_AGENTS=1 $invoked_as "One-line typo fix"        # skip the subagent team
-    AGENT_NO_GPG_SIGN=0 $invoked_as "..."                    # keep your commit signing
-    AGENT_CLAUDE_PERMISSION_MODE=acceptEdits $invoked_as "..."  # edits free, commands ask
-
-  Multi-line or leading-dash prompts ('--' ends option parsing):
-    $invoked_as codex -- "- refactor the failing test
-    - then add a regression test"
-
-  Parallel sessions — use 'wt'. Two in-place runs in one repository share a
-  single scaffold, and whichever finishes first removes it:
-    $invoked_as wt       "Feature A" &
-    $invoked_as wt codex "Feature B" &
-
-environment overrides (legacy AGENT_WT_* names still honored):
-  AGENT_CLAUDE_MODEL            opus — alias for the latest Opus model
-                                (claude-opus-5[1m] for the 1M-token context)
-  AGENT_CLAUDE_EFFORT           max (empty = inherit effortLevel from settings.json)
-  AGENT_CLAUDE_PERMISSION_MODE  dontAsk — fallback autorun mode if bypass is
-                                vetoed (acceptEdits, auto, bypassPermissions,
-                                dontAsk, plan, manual; empty omits the flag)
-  AGENT_CLAUDE_SETTING_SOURCES  user,project,local (empty = Claude's default)
-  AGENT_CODEX_MODEL             gpt-6-astra
-  AGENT_CODEX_EFFORT            highest advertised effort; Astra fallback: ultra
-                                unknown models need a catalogue entry or override
-  AGENT_CODEX_TIER              fast (empty inherits Codex config)
-  AGENT_CODEX_SEARCH            1 — force live web search (0 omits --search)
-  AGENT_WORKTREE_DIR            <main-repo-parent>/<main-repo>.worktrees
-  AGENT_DIRENV                  1 — link + allow .envrc in each worktree and
-                                launch the agent under 'direnv exec' (0 disables)
-  AGENT_SUPPORT_DIR             $support_dir
-  AGENT_NO_AGENTS               0 (1 skips the bundled subagent team)
-  AGENT_NO_GPG_SIGN             1 — commits unsigned, scoped to this run so the
-                                auto-commits never block on a passphrase prompt
-                                (0 keeps your normal signing)
-
-notes:
-  * Claude uses the 'opus' alias. Codex defaults to Astra even with a missing
-    or stale model catalogue. The catalogue only supplies its reasoning levels.
-  * Codex preloads workflow instructions with -c developer_instructions in both
-    prompted and interactive sessions; this overrides that config field for the
-    invocation. Repository AGENTS.md instructions are still read.
-  * If a Claude session still shows "manual" in the mode indicator, bypass was
-    vetoed AND --permission-mode was dropped. Claude states the reason in-session
-    — org policy, a settings 'disableBypassPermissionsMode', or a disclaimer not
-    yet accepted interactively. dontAsk is exempt from that veto, so leaving
-    AGENT_CLAUDE_PERMISSION_MODE set keeps the run unattended regardless.
-    Caveat: under dontAsk anything that WOULD have prompted is denied rather than
-    asked, so 'ask' rules in your org settings become hard denials.
-  * The command name is set at install time and reached through a symlink, which
-    this script resolves to find agent.d/ beside itself — so it can be called
-    anything. Not 'agent', though: the cursor-agent installer owns
-    ~/.local/bin/agent and recreates it on every self-update, silently
-    overwriting anything parked there.
-  * The bare words 'wt', 'here', 'worktrees', 'claude' and 'codex' are only
-    recognized while they lead the argument list — everything from the first
-    other word on is the prompt. So "$invoked_as claude wt ..." keeps 'wt' in the
-    prompt, and a task that genuinely starts with one of those words just needs
-    quoting: "$invoked_as 'codex is failing to build'" runs Claude on that prompt.
-  * Worktrees are always grouped next to the MAIN worktree, even when you launch
-    from inside another worktree. Everything for one repository therefore lands in
-    one predictable directory, which is also what makes the direnv blessing and
-    '$invoked_as worktrees' straightforward.
-  * direnv: each worktree gets a symlink to the main worktree's .envrc, that path
-    is 'direnv allow'-ed, and the agent runs under 'direnv exec' so it inherits
-    the project environment. Trust is only ever propagated from an .envrc you
-    already allowed — this never blesses one you have not reviewed. A repo
-    post-checkout hook that creates the same symlink is harmless: the link is only
-    created when absent, never replaced.
-  * The team — architect, precision-coder, critic, chronicler, test-engineer,
-    researcher, security-auditor — is installed as real subagents:
-    .claude/agents/*.md for Claude, .codex/agents/*.toml for Codex.
-  * No sandbox, no approval prompts. In-place mode has NO isolation: the agent
-    edits your real working tree and can commit to your current branch. Only run
-    it on tasks and repositories you trust.
-
-full docs: $support_dir/README.md
+  $invoked_as "Fix the failing auth test"
+  $invoked_as wt codex -b main -n limiter "Add rate limiting to the API"
+  AGENT_CLAUDE_MODEL=sonnet $invoked_as      # no prompt: an interactive session
 EOF
   exit 0
-}
-
-# ---- Small env helpers -----------------------------------------------------
-# first_set     : first NON-EMPTY value among the named vars (else fail).
-# first_defined : first value among the named vars that is SET, even if empty
-#                 (so an explicit empty value can mean "omit the flag").
-first_set() {
-  local n
-  for n in "$@"; do
-    if [ -n "${!n:-}" ]; then printf '%s' "${!n}"; return 0; fi
-  done
-  return 1
-}
-first_defined() {
-  local n
-  for n in "$@"; do
-    if [ -n "${!n+x}" ]; then printf '%s' "${!n}"; return 0; fi
-  done
-  return 1
 }
 
 # ---- Resolve this script's real directory (follow symlinks) ----------------
@@ -356,23 +80,11 @@ while [ -h "$src" ]; do
   esac
 done
 script_dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
-# Platform helpers belong to the package, independently of custom agent files.
-for _platform in "$script_dir/agent.d/lib/platform.sh" "$script_dir/../agent.d/lib/platform.sh"; do
-  if [ -f "$_platform" ]; then
-    . "$_platform"
-    ai_prefer_homebrew
-    break
-  fi
-done
-unset _platform
-support_dir="$(first_set AGENT_SUPPORT_DIR AGENT_WT_SUPPORT_DIR || true)"
+support_dir="${AGENT_SUPPORT_DIR:-}"
 if [ -z "$support_dir" ]; then
-  if [ -d "$script_dir/agent.d" ]; then
-    support_dir="$script_dir/agent.d"
-  elif [ -d "$script_dir/../agent.d" ]; then
+  support_dir="$script_dir/agent.d"                        # installed layout
+  if [ ! -d "$support_dir" ] && [ -d "$script_dir/../agent.d" ]; then
     support_dir="$(cd "$script_dir/../agent.d" && pwd -P)" # source checkout
-  else
-    support_dir="$script_dir/agent-wt.d"   # legacy layout
   fi
 fi
 
@@ -380,18 +92,18 @@ fi
 # Claude: "opus" is an alias the CLI resolves to the newest Opus model, so this
 # never needs bumping. (`claude --model` accepts the opus / sonnet / haiku /
 # fable aliases or a full model id such as claude-opus-5.)
-CLAUDE_MODEL="$(first_set AGENT_CLAUDE_MODEL AGENT_WT_CLAUDE_MODEL || printf 'opus')"
-CLAUDE_EFFORT="$(first_defined AGENT_CLAUDE_EFFORT AGENT_WT_CLAUDE_EFFORT || printf 'max')"
+# `${VAR-default}` (no colon) where an explicitly empty value means "omit the
+# flag"; `${VAR:-default}` where empty just means "use the default".
+CLAUDE_MODEL="${AGENT_CLAUDE_MODEL:-opus}"
+CLAUDE_EFFORT="${AGENT_CLAUDE_EFFORT-max}"
 # Fallback autorun mode. --dangerously-skip-permissions asks for
 # bypassPermissions, but that one mode can be vetoed (org feature gate,
 # permissions.disableBypassPermissionsMode, or a disclaimer never accepted
 # interactively) — and when it is vetoed the session falls to "default", which the
 # UI labels "manual". --permission-mode is exempt from that veto and is the next
 # candidate Claude considers, so it keeps the session unattended either way.
-CLAUDE_PERMISSION_MODE="$(first_defined AGENT_CLAUDE_PERMISSION_MODE AGENT_WT_CLAUDE_PERMISSION_MODE \
-                          || printf 'dontAsk')"
-CLAUDE_SETTING_SOURCES="$(first_defined AGENT_CLAUDE_SETTING_SOURCES AGENT_WT_CLAUDE_SETTING_SOURCES \
-                          || printf 'user,project,local')"
+CLAUDE_PERMISSION_MODE="${AGENT_CLAUDE_PERMISSION_MODE-dontAsk}"
+CLAUDE_SETTING_SOURCES="${AGENT_CLAUDE_SETTING_SOURCES-user,project,local}"
 
 # The requested default is Astra, even with an absent or stale CLI cache.
 # The cache is an optional capability hint for the SELECTED model, not a ranking
@@ -419,51 +131,51 @@ print(next((e for e in ranked if e in supported), ""))
 PY
 }
 
-CODEX_MODEL="$(first_set AGENT_CODEX_MODEL AGENT_WT_CODEX_MODEL || printf 'gpt-6-astra')"
-CODEX_EFFORT="$(first_set AGENT_CODEX_EFFORT AGENT_WT_CODEX_EFFORT || true)"
-CODEX_TIER="$(first_defined AGENT_CODEX_TIER AGENT_WT_CODEX_TIER || printf 'fast')"
+CODEX_MODEL="${AGENT_CODEX_MODEL:-gpt-6-astra}"
+CODEX_EFFORT="${AGENT_CODEX_EFFORT:-}"   # empty => resolved per model below
+CODEX_TIER="${AGENT_CODEX_TIER-fast}"
 # Explicit empty value also disables --search.
-CODEX_SEARCH="$(first_defined AGENT_CODEX_SEARCH AGENT_WT_CODEX_SEARCH || printf '1')"
+CODEX_SEARCH="${AGENT_CODEX_SEARCH-1}"
 
 # ---- Parse arguments -------------------------------------------------------
+use_worktree=0
 agent=""
 base=""          # empty => resolve to current/default branch below
 name=""
 audit=0          # 'worktrees' mode: report on the repo's worktrees, run no agent
 audit_fix=0      # ... and actually apply the repairs
 
+# 'worktrees' is a subcommand only as the first word, and takes only --fix.
+if [ "${1:-}" = worktrees ]; then
+  audit=1
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --fix)     audit_fix=1 ;;
+      -h|--help) usage 0 ;;
+      *)         echo "Unexpected argument: $1" >&2; usage ;;
+    esac
+    shift
+  done
+fi
+
+# Leading keywords, in any order and each at most once; the first word that is
+# not one, or repeats one, starts the prompt.
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --wt|--worktree)
+    wt)
+      [ "$use_worktree" -eq 0 ] || break
       use_worktree=1
       shift
       ;;
-    --here|--in-place|--no-wt)
-      use_worktree=0
+    claude|codex)
+      [ -z "$agent" ] || break
+      agent="$1"
       shift
       ;;
     --fix)
-      audit_fix=1
-      shift
-      ;;
-    wt|here|worktrees)
-      # Bare mode words are only meaningful before the agent is chosen; after
-      # that they are part of the prompt.
-      if [ -z "$agent" ]; then
-        case "$1" in
-          wt)        use_worktree=1 ;;
-          here)      use_worktree=0 ;;
-          worktrees) audit=1 ;;
-        esac
-        shift
-      else
-        break
-      fi
-      ;;
-    -a|--agent)
-      [ "$#" -ge 2 ] || usage
-      agent="$2"
-      shift 2
+      echo "--fix only applies to '$invoked_as worktrees'." >&2
+      exit 2
       ;;
     -b|--base)
       [ "$#" -ge 2 ] || usage
@@ -482,15 +194,6 @@ while [ "$#" -gt 0 ]; do
       shift
       break
       ;;
-    codex|claude)
-      # First bare codex/claude token selects the agent; once set, it is prompt.
-      if [ -z "$agent" ]; then
-        agent="$1"
-        shift
-      else
-        break
-      fi
-      ;;
     -*)
       echo "Unknown option: $1" >&2
       usage
@@ -503,10 +206,6 @@ done
 
 # The agent name is optional; Claude is the default.
 agent="${agent:-claude}"
-case "$agent" in
-  codex|claude) ;;
-  *) echo "Invalid agent: '$agent' (use codex or claude)." >&2; usage ;;
-esac
 
 # Resolve only for Codex launches: help, worktree audits, and Claude must work
 # even if a Codex override has no known capabilities.
@@ -526,14 +225,10 @@ if [ "$agent" = codex ] && [ "$audit" -eq 0 ] && [ -z "$CODEX_EFFORT" ]; then
   fi
 fi
 
-# --base cuts a branch, so it is still worktree-only. --name is a session label
-# in both modes now, and only additionally names the branch under 'wt'.
+# --base only means something for a new worktree branch. --name labels the
+# session in either mode, and under 'wt' also names the branch.
 if [ "$use_worktree" -eq 0 ] && [ -n "$base" ]; then
   echo "--base only applies in worktree mode; add 'wt' (e.g. $invoked_as wt $agent ...)." >&2
-  exit 2
-fi
-if [ "$audit_fix" -eq 1 ] && [ "$audit" -eq 0 ]; then
-  echo "--fix only applies to '$invoked_as worktrees'." >&2
   exit 2
 fi
 
@@ -545,7 +240,7 @@ prompt="$*"
 repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [ "$use_worktree" -eq 1 ] && [ -z "$repo" ]; then
   echo "Not inside a git repository (or it is bare); worktree mode needs one." >&2
-  echo "Use '--here' to work in place in the current directory." >&2
+  echo "Drop 'wt' to work in place in the current directory." >&2
   exit 1
 fi
 if [ "$audit" -eq 1 ] && [ -z "$repo" ]; then
@@ -580,8 +275,7 @@ wt_root=""
 if [ -n "$main_worktree" ]; then
   anchor_name="$(basename "$main_worktree")"
   [ -n "$main_is_bare" ] && anchor_name="${anchor_name%.git}"
-  wt_root="$(first_set AGENT_WORKTREE_DIR AGENT_WT_WORKTREE_DIR CODEX_WORKTREE_DIR \
-             || printf '%s/%s.worktrees' "$(dirname "$main_worktree")" "$anchor_name")"
+  wt_root="${AGENT_WORKTREE_DIR:-$(dirname "$main_worktree")/$anchor_name.worktrees}"
   # A relative override would otherwise mean different things to `git worktree
   # add` (resolved against the cwd) and to the audit's prefix comparisons against
   # git's always-absolute paths.
@@ -593,14 +287,21 @@ fi
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"   # PID suffix avoids same-second collisions
 
+# shq <value> — shell-quote a value for a command line printed for pasting.
+shq() { printf '%q' "$1"; }
+
 # ---- direnv integration ----------------------------------------------------
-# See the "direnv" note in the header for the rationale. In short: link the main
-# worktree's .envrc into each worktree, bless that path, and launch the agent
-# under `direnv exec` so the AGENT — not just your interactive shell — sees the
-# project environment.
-use_direnv="$(first_defined AGENT_DIRENV AGENT_WT_DIRENV || printf '1')"
+# Link the main worktree's .envrc into each worktree, bless that path, and launch
+# the agent under `direnv exec` so the AGENT — not just your interactive shell —
+# sees the project environment. Trust is only ever propagated from an .envrc the
+# user already allowed, never created; in place, `direnv allow` is never run.
+# That covers the .envrc's bytes only: it still runs against the worktree's own
+# files (`dotenv`, `PATH_add bin`, `use flake`), so a worktree cut from an
+# untrusted ref should be run with AGENT_DIRENV=0.
+use_direnv="${AGENT_DIRENV-1}"
 direnv_note=""
 direnv_launch=()   # command prefix for the agent launch; empty = launch directly
+envrc_linked=""    # set when this launch linked the main .envrc into the worktree
 
 # direnv normalises paths inconsistently: `direnv allow` resolves symlinks, while
 # `direnv exec` only cleans the path. Feed both the PHYSICAL path so the token
@@ -663,6 +364,10 @@ direnv_run() (
 # This is NOT the question "is it allowed": on an explicitly DENIED .envrc, direnv
 # exec still runs the command, silently, with no environment, and exits 0.
 direnv_ok() { direnv_run exec "$(direnv_phys "$1")" true >/dev/null 2>&1; }
+
+# direnv_current — the trust checks below parse `direnv status --json`, which needs
+# direnv 2.33+. An older direnv is treated as absent, not as blocking every .envrc.
+direnv_current() { direnv_run version 2.33.0 >/dev/null 2>&1; }
 
 # direnv_allowed <dir> — STRICT, and fails CLOSED. True only when direnv positively
 # reports that the .envrc it found for <dir> is allowed. False for blocked (1),
@@ -774,10 +479,9 @@ bless_envrc() {
 }
 
 # setup_direnv — run once for the chosen working root, just before launch. Never
-# fatal: every failure downgrades to a plain launch and says why. Re-running the
-# link+bless on every launch is deliberate — direnv keys trust on the .envrc's
-# CONTENTS as well as its path, so editing the shared .envrc blocks every worktree
-# at once, and this is what quietly heals them.
+# fatal: every failure downgrades to a plain launch and says why. A new worktree
+# gets the main worktree's .envrc linked and allowed only if the user has already
+# allowed it there.
 setup_direnv() {
   local found
 
@@ -786,28 +490,36 @@ setup_direnv() {
     direnv_note="off (direnv not installed)"
     return 0
   fi
+  if ! direnv_current; then
+    direnv_note="off (direnv older than 2.33)"
+    return 0
+  fi
 
-  if [ "$use_worktree" -eq 1 ] && [ -n "$main_worktree" ]; then
-    link_envrc  "$work_dir" || true
+  if [ "$use_worktree" -eq 1 ] && [ -n "$main_worktree" ] \
+     && direnv_allowed "$main_worktree" "$(direnv_phys "$main_worktree")/.envrc"; then
+    if link_envrc "$work_dir"; then envrc_linked=1; fi
     bless_envrc "$work_dir" || true
   fi
 
   found="$(find_envrc "$work_dir" || true)"
+  # A main .envrc left unlinked because it is not allowed is still the one to report.
+  if [ -z "$found" ] && [ "$use_worktree" -eq 1 ] && [ -f "$main_worktree/.envrc" ]; then
+    found="$main_worktree/.envrc"
+  fi
   if [ -z "$found" ]; then
     direnv_note="no .envrc in scope"
   elif ! direnv_allowed "$work_dir"; then
     direnv_note="NOT loaded — $found is blocked or denied"
     echo "WARN: direnv has not allowed $found, so the agent will run WITHOUT the" >&2
-    echo "      project environment. Review it, then run:" >&2
+    echo "      project environment. Review it, then allow its directory (not the file):" >&2
     echo "        direnv allow $(printf '%q' "$(dirname "$found")")" >&2
-    echo "      (the directory, not the file — see 'The symlink trap' in the README)" >&2
   elif direnv_ok "$work_dir"; then
     direnv_launch=("${direnv_scrub[@]}" direnv exec "$(direnv_phys "$work_dir")")
     direnv_note="$found"
   else
     direnv_note="NOT loaded — $found is allowed but failed to evaluate"
     echo "WARN: $found is allowed but errored, so the agent will run WITHOUT the" >&2
-    echo "      project environment. Check it with:  direnv exec \"$work_dir\" true" >&2
+    echo "      project environment. Check it with:  direnv exec $(shq "$work_dir") true" >&2
   fi
 }
 
@@ -820,14 +532,14 @@ setup_direnv() {
 #   GONE   (registration without a directory)      -> pruned by --fix
 #   NESTED (inside another tree's <name>.worktrees/) -> moved by --fix. That is
 #          the old anchor bug's exact signature and nothing else produces it.
-#   DEEP   (under the root, but in a layout of your own — a '/' in --name makes
-#          one)                                    -> NEVER moved automatically
+#   DEEP   (under the root, but in a layout of your own) -> NEVER moved automatically
 #   STRAY  (somewhere else entirely)               -> NEVER moved automatically,
 #          because you may well have put it there on purpose.
 # For the two "never" cases the exact `git worktree move` line is printed instead,
 # so you can opt in per tree. Moving a tree breaks absolute paths into it (venvs,
 # IDE/LSP state, direnv blessings), which is the user's call to make, not ours.
-# direnv repairs (link + allow) apply to every live worktree either way.
+# direnv repairs (link + allow) apply to every live worktree either way, and only
+# while the main worktree's .envrc is allowed.
 run_audit() {
   local rc_src="$main_worktree/.envrc"
   local direnv_state src_allowed="" direnv_usable=""
@@ -840,6 +552,8 @@ run_audit() {
     direnv_state="off (AGENT_DIRENV=0)"
   elif ! command -v direnv >/dev/null 2>&1; then
     direnv_state="off (direnv not installed)"
+  elif ! direnv_current; then
+    direnv_state="off (direnv older than 2.33)"
   elif [ ! -f "$rc_src" ]; then
     direnv_usable=1
     direnv_state="no .envrc in the main worktree — nothing to propagate"
@@ -849,7 +563,7 @@ run_audit() {
     direnv_state="$rc_src (allowed)"
   else
     direnv_usable=1
-    direnv_state="$rc_src (BLOCKED — run: direnv allow \"$rc_src\")"
+    direnv_state="$rc_src (BLOCKED — run: direnv allow $(shq "$(dirname "$rc_src")"))"
   fi
 
   echo "repository:     $main_worktree"
@@ -898,8 +612,8 @@ run_audit() {
     elif [ "${path#"$wt_root"/}" != "$path" ]; then
       # Under the root but not directly under it. Only the anchor bug's exact
       # signature — a tree inside another tree's own "<name>.worktrees/" — is
-      # auto-consolidated. Any other depth is a layout the user chose (a '/' in
-      # --name produces one), so it is reported and left alone.
+      # auto-consolidated. Any other depth is a layout the user chose, so it is
+      # reported and left alone.
       case "${path#"$wt_root"/}" in
         *.worktrees/*) label="NESTED" ;;
         *)             label="DEEP" ;;
@@ -989,7 +703,7 @@ run_audit() {
     # subsequent `git -C "$repo"` here) pointing at a path that no longer exists.
     if [ "$path" = "$repo" ]; then
       echo "skip: '$path' is the worktree you are in — re-run from elsewhere:" >&2
-      echo "        (cd \"$main_worktree\" && $invoked_as worktrees --fix)" >&2
+      echo "        (cd $(shq "$main_worktree") && $(shq "$invoked_as") worktrees --fix)" >&2
       continue
     fi
     if git -C "$repo" worktree move "$path" "$dst"; then
@@ -1008,22 +722,21 @@ run_audit() {
   # direnv pass, over the post-move paths. A move invalidates the old blessing
   # (direnv keys it on the path), and the .envrc symlink is absolute so it rode
   # along intact — re-blessing at the new path is all that is needed.
-  if [ -n "$direnv_usable" ]; then
+  if [ -n "$src_allowed" ]; then
     for path in ${live[@]+"${live[@]}"}; do
       [ -d "$path" ] || continue
       if link_envrc "$path"; then
         echo "linked: $path/.envrc -> $rc_src"
         fixed=$((fixed + 1))
       fi
-      if [ -n "$src_allowed" ] && bless_envrc "$path"; then
+      if bless_envrc "$path"; then
         fixed=$((fixed + 1))
       fi
     done
-    if [ -f "$rc_src" ] && [ -z "$src_allowed" ]; then
-      echo
-      echo "NOTE: nothing could be blessed — the source .envrc is not allowed yet." >&2
-      echo "      Review it, then:  direnv allow \"$rc_src\"" >&2
-    fi
+  elif [ -n "$direnv_usable" ] && [ -f "$rc_src" ]; then
+    echo
+    echo "NOTE: nothing was linked or allowed — the source .envrc is not allowed yet." >&2
+    echo "      Review it, then:  direnv allow $(shq "$(dirname "$rc_src")")" >&2
   fi
 
   echo
@@ -1112,15 +825,6 @@ if [ "$use_worktree" -eq 1 ]; then
 
   mkdir -p "$wt_root"
   git -C "$repo" worktree add -b "$branch" "$work_dir" "$base"
-
-  merge_back="$(cat <<MB
-cd "$repo"
-git switch "$target_branch"
-git merge --ff-only "$branch"        # if this is rejected, use:  git merge --no-ff "$branch"
-git worktree remove "$work_dir"
-git branch -d "$branch"
-MB
-  )"
 else
   work_dir="${repo:-$PWD}"
   base=""
@@ -1142,7 +846,7 @@ fi
 # THIS run via GIT_CONFIG_* env vars that the agent's git invocations inherit —
 # the repo's own git config is never touched (worktrees share .git/config, so
 # writing to it would leak repo-wide). Set AGENT_NO_GPG_SIGN=0 to keep signing.
-no_gpg="$(first_set AGENT_NO_GPG_SIGN AGENT_WT_NO_GPG_SIGN || printf '1')"
+no_gpg="${AGENT_NO_GPG_SIGN:-1}"
 if [ "$no_gpg" != "0" ]; then
   gpg_idx="${GIT_CONFIG_COUNT:-0}"
   export "GIT_CONFIG_KEY_${gpg_idx}=commit.gpgsign"
@@ -1153,81 +857,75 @@ else
   gpg_sign_note="on (your git config)"
 fi
 
-# ---- Temporary-scaffold bookkeeping (in-place mode) ------------------------
-# In a worktree everything is throwaway. In place, we must leave the repository
-# exactly as we found it: track every file/dir we create, remove them on exit,
-# and keep them out of `git status` meanwhile so an over-eager `git add -A`
-# can't sweep them into a commit.
-created_files=()
+# ---- Temporary scaffold ----------------------------------------------------
+# The team, a self-ignoring .gitignore in its directory, and a DEVLOG.md are
+# scaffolding in both modes. Each file is recorded with the checksum of what was
+# put there, and on exit is removed only if it still matches and git does not
+# track it, so nothing the user or the agent changed or committed is lost. The
+# .gitignore keeps the team out of `git status` and `git add -A` without
+# touching anything shared with other sessions or worktrees.
+created_files=()   # scaffold files ...
+created_sums=()    # ... and the cksum each must still have to be removed
 created_dirs=()
-exclude_file=""
-exclude_marker="agent scaffold ${stamp}"
-devlog_scaffolded=""
+
+# scaffold_untracked FILE — FILE (under $work_dir) is a plain file that git
+# positively reports as untracked; outside a repository, any plain file.
+scaffold_untracked() {
+  local rc=0
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  [ -n "$repo" ] || return 0
+  git -C "$work_dir" ls-files --error-unmatch -- "${1#"$work_dir"/}" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 1 ]
+}
 
 cleanup_scaffold() {
-  local f i tmp
-  for f in "${created_files[@]-}"; do
-    [ -n "$f" ] && rm -f -- "$f"
+  local i
+  for (( i=0; i<${#created_files[@]}; i++ )); do
+    if [ -f "${created_files[i]}" ] && scaffold_untracked "${created_files[i]}" \
+       && [ "$(cksum <"${created_files[i]}")" = "${created_sums[i]-}" ]; then
+      rm -f -- "${created_files[i]}" || true
+    fi
   done
   for (( i=${#created_dirs[@]}-1; i>=0; i-- )); do
     rmdir -- "${created_dirs[i]}" 2>/dev/null || true
   done
-  # Only remove a scaffolded DEVLOG.md if nothing ever wrote to it.
-  if [ -n "$devlog_scaffolded" ] && [ -f "$work_dir/DEVLOG.md" ] \
-     && cmp -s "$work_dir/DEVLOG.md" "$support_dir/DEVLOG.template.md"; then
-    rm -f -- "$work_dir/DEVLOG.md"
-  fi
-  if [ -n "$exclude_file" ] && [ -f "$exclude_file" ]; then
-    tmp="$(mktemp)" || return 0
-    if awk -v m="$exclude_marker" '
-         $0 == "# >>> " m { skip = 1; next }
-         $0 == "# <<< " m { skip = 0; next }
-         !skip
-       ' "$exclude_file" >"$tmp"; then
-      cat "$tmp" >"$exclude_file"   # rewrite in place, preserving permissions
-    fi
-    rm -f -- "$tmp"
-  fi
 }
 
 track_mkdir() {  # create dir (and remember it) only if it did not already exist
   local d="$1"
   [ -d "$d" ] && return 0
   mkdir -p -- "$d"
-  [ "$use_worktree" -eq 0 ] && created_dirs+=("$d")
+  created_dirs+=("$d")
   return 0
 }
 
-install_file() {  # never clobber a file the user already has
+# install_file SRC DEST — put SRC at DEST as scaffold. An existing DEST is adopted
+# only if it is an untracked, byte-identical copy (as a killed session leaves);
+# anything else there is the user's and is left alone.
+install_file() {
   local src_file="$1" dest="$2"
-  [ -e "$dest" ] && return 1
-  cp -- "$src_file" "$dest"
-  [ "$use_worktree" -eq 0 ] && created_files+=("$dest")
-  return 0
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    scaffold_untracked "$dest" && cmp -s -- "$src_file" "$dest" || return 1
+  else
+    cat -- "$src_file" >"$dest" || return 1
+  fi
+  local sum
+  sum="$(cksum <"$dest")" || return 1
+  created_files+=("$dest")
+  created_sums+=("$sum")
 }
 
-git_ignore_locally() {  # hide the scaffold from git status, for this session only
-  local pattern common
-  [ -n "$repo" ] || return 0
-  common="$(git -C "$work_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
-  [ -n "$common" ] && [ -d "$common/info" ] || return 0
-  exclude_file="$common/info/exclude"
-  {
-    printf '# >>> %s\n' "$exclude_marker"
-    for pattern in "$@"; do printf '%s\n' "$pattern"; done
-    printf '# <<< %s\n' "$exclude_marker"
-  } >>"$exclude_file" || exclude_file=""
-}
-
-if [ "$use_worktree" -eq 0 ]; then
-  trap cleanup_scaffold EXIT INT TERM
-fi
+# Exit on any signal before the agent starts; EXIT removes the scaffold.
+trap cleanup_scaffold EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # ---- Install the bundled subagent team -------------------------------------
 # Claude reads .claude/agents/*.md; Codex reads .codex/agents/*.toml (and the
 # launch marks the working root trusted so Codex loads its project layers).
 agents_installed="none"
-no_agents="$(first_set AGENT_NO_AGENTS AGENT_WT_NO_AGENTS || printf '0')"
+no_agents="${AGENT_NO_AGENTS:-0}"
 if [ "$no_agents" != "1" ]; then
   case "$agent" in
     claude) team_dir="$work_dir/.claude/agents"; team_src="$support_dir/agents";       team_glob="*.md" ;;
@@ -1244,14 +942,8 @@ if [ "$no_agents" != "1" ]; then
     for f in "${team_files[@]}"; do
       install_file "$f" "$team_dir/$(basename "$f")" || true
     done
-    agents_installed="$team_dir (${#team_files[@]} agents)"
-    if [ "$use_worktree" -eq 0 ]; then
-      agents_installed="$agents_installed [temporary — removed on exit]"
-      case "$agent" in
-        claude) git_ignore_locally '/.claude/agents/' ;;
-        codex)  git_ignore_locally '/.codex/agents/' ;;
-      esac
-    fi
+    install_file /dev/stdin "$team_dir/.gitignore" <<<'*' || true
+    agents_installed="$team_dir (${#team_files[@]} agents) [temporary — removed on exit]"
   else
     echo "WARN: no subagent definitions found in $team_src —" >&2
     echo "      $agent will be told to use a team that isn't installed." >&2
@@ -1259,15 +951,30 @@ if [ "$no_agents" != "1" ]; then
   fi
 
   # Always scaffold a logbook so the chronicler has a home.
-  if [ ! -f "$work_dir/DEVLOG.md" ] && [ -f "$support_dir/DEVLOG.template.md" ]; then
-    if cp "$support_dir/DEVLOG.template.md" "$work_dir/DEVLOG.md"; then
-      [ "$use_worktree" -eq 0 ] && devlog_scaffolded=1
-    fi
+  if [ -f "$support_dir/DEVLOG.template.md" ]; then
+    install_file "$support_dir/DEVLOG.template.md" "$work_dir/DEVLOG.md" || true
   fi
 fi
 
 # ---- direnv: link, bless, and decide how to launch --------------------------
 setup_direnv
+
+# The merge-back recipe, printed after the session and quoted in the prompt. An
+# .envrc link ai made is untracked, and would make `git worktree remove` refuse.
+if [ "$use_worktree" -eq 1 ]; then
+  envrc_rm=""
+  if [ -n "$envrc_linked" ]; then
+    envrc_rm="rm $(shq "$work_dir/.envrc")   # the direnv link ai made"$'\n'
+  fi
+  merge_back="$(cat <<MB
+cd $(shq "$repo")
+git switch $(shq "$target_branch")
+git merge --ff-only $(shq "$branch")        # if this is rejected, use:  git merge --no-ff $(shq "$branch")
+${envrc_rm}git worktree remove $(shq "$work_dir")
+git branch -d $(shq "$branch")
+MB
+  )"
+fi
 
 # ---- Report ----------------------------------------------------------------
 echo "agent:         $agent" >&2
@@ -1321,6 +1028,8 @@ fi
 # ---- Build the guarded prompt ----------------------------------------------
 # Shared guardrails + logbook discipline. Commits are ALLOWED so the chronicler
 # can build a clean history; everything that rewrites or publishes history is not.
+scaffold_dir=".claude/agents"
+[ "$agent" = "codex" ] && scaffold_dir=".codex/agents"
 if [ "$use_worktree" -eq 1 ]; then
   read -r -d '' guard_scope <<EOF || true
 Work only inside this Git worktree:
@@ -1337,6 +1046,8 @@ Rules:
 - A .envrc symlink may be present so that direnv hands you this project's
   environment. It is scaffolding, not part of your work: never commit, edit or
   delete it.
+- $scaffold_dir/ is a temporary scaffold for this session and is removed when
+  the session ends. Never commit it, and do not rely on it persisting.
 - Do not install global packages.
 - Prefer minimal, reviewable changes. Run relevant local tests when practical.
 EOF
@@ -1354,9 +1065,6 @@ $merge_back
 EOF
 
 elif [ -n "$repo" ]; then
-  scaffold_dir=".claude/agents"
-  [ "$agent" = "codex" ] && scaffold_dir=".codex/agents"
-
   dirty_rule=""
   if [ -n "$pre_existing_changes" ]; then
     dirty_rule="
@@ -1552,11 +1260,10 @@ $guardrails"
     if [ -n "$name" ] && [ "$use_worktree" -eq 0 ]; then
       echo "note: codex has no launch-time session name — use /name \"$name\" in-session." >&2
     fi
+    # Without a prompt, Codex starts with the same instructions and waits for input.
+    launch=(codex "${codex_args[@]}")
     if [ -n "$prompt" ]; then
-      ${direnv_launch[@]+"${direnv_launch[@]}"} codex "${codex_args[@]}" -- "$prompt" || launch_status=$?
-    else
-      # No prompt: preload the same developer instructions and wait for input.
-      ${direnv_launch[@]+"${direnv_launch[@]}"} codex "${codex_args[@]}" || launch_status=$?
+      launch+=(-- "$prompt")
     fi
     ;;
   claude)
@@ -1599,15 +1306,20 @@ $guardrails"
       fi
     fi
     if [ -n "$prompt" ]; then
-      ${direnv_launch[@]+"${direnv_launch[@]}"} claude "${claude_args[@]}" "$guarded_prompt" || launch_status=$?
+      launch=(claude "${claude_args[@]}" "$guarded_prompt")
     else
       # No prompt: drop into an interactive Claude session with the guardrails +
       # team directive in the system prompt, so you can /effort, /model, etc.,
       # then type your task.
-      ${direnv_launch[@]+"${direnv_launch[@]}"} claude "${claude_args[@]}" --append-system-prompt "$guardrails" || launch_status=$?
+      launch=(claude "${claude_args[@]}" --append-system-prompt "$guardrails")
     fi
     ;;
 esac
+
+# The agent owns the terminal from here: a Ctrl-C, TERM or HUP aimed at it must
+# not kill this launcher before the post-run recipe. EXIT still cleans up.
+trap : INT TERM HUP
+${direnv_launch[@]+"${direnv_launch[@]}"} "${launch[@]}" || launch_status=$?
 
 # ---- Post-run instructions -------------------------------------------------
 if [ "$use_worktree" -eq 1 ]; then
@@ -1616,9 +1328,9 @@ if [ "$use_worktree" -eq 1 ]; then
 ${agent} session finished.
 
 Review the work in the worktree:
-  cd "$work_dir"
+  cd $(shq "$work_dir")
   git status --short
-  git log --oneline "$base..$branch"
+  git log --oneline $(shq "$base..$branch")
 
 Bring the committed work back to the regular branch:
 $merge_back
@@ -1629,7 +1341,7 @@ elif [ -n "$repo" ]; then
 ${agent} session finished — work is already on branch "${current_branch:-<detached HEAD>}".
 
 Review what changed:
-  cd "$work_dir"
+  cd $(shq "$work_dir")
   git status --short
   git log --oneline ${start_sha:-HEAD}..HEAD
   git diff ${start_sha:-HEAD}

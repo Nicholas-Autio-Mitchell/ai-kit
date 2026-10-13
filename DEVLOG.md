@@ -12,6 +12,53 @@ Conventions:
 
 ---
 
+## 2026-10-13 — One command grammar; the team scaffold is temporary everywhere
+
+**What:** One grammar: `ai [wt] [claude|codex] [-b REF] [-n NAME] [--] [prompt...]`
+and `ai worktrees [--fix]`; `wt`, `claude` and `codex` are accepted in any order,
+once each. Removed: `-a`/`--agent`, `--wt`, `--here` and the other aliases, the
+`agent-wt` / `claude-wt` / `codex-wt` invocation names (`bin/*-wt` deleted), and
+the legacy `AGENT_WT_*` / `CODEX_WORKTREE_DIR` variables; unknown options exit 2.
+`--help` is 40 lines, the file header 5. `agent.d/AGENTS.codex.md`
+(unreferenced) is deleted.
+- Scaffold: the subagent team is temporary in both modes. A self-ignoring
+  `.gitignore` (`*`) inside the team directory hides it, replacing a block in
+  the shared `.git/info/exclude`; it is recorded with checksums and removed on
+  exit only if unchanged and untracked; a killed session's leftovers are
+  adopted and cleaned by the next run. The `DEVLOG.md` scaffold follows suit.
+- Signals: Ctrl-C / TERM / HUP before launch exit 130 / 143 / 129 after
+  cleanup, without launching; during the session the launcher survives to
+  print the recipe and propagate the agent's exit status.
+- The worktree `.envrc` link is made only when the main `.envrc` is allowed,
+  and the merge-back recipe then removes it before `git worktree remove`. Every
+  value in printed recipes and in the agent prompt is shell-quoted (`%q`).
+  direnv older than 2.33 is reported as off.
+- `codex-launch.py` (now on `parallel_runner`) and `direnv-worktree.sh` follow
+  the new interface; `direnv-worktree.sh` now fails if a job notice leaks
+  (sections 27 and 29), guarding the `direnv_run` fix below.
+
+**Why:** The owner asked for the cleanest, most concise interface with no
+legacy. Review found that the old `wt` scaffold made `git worktree remove` fail
+and could get committed; that rewriting the shared exclude file could wipe a
+user's exclude file when several `wt` sessions ended together (3 of 12 rounds
+with 4 sessions); that Ctrl-C before launch launched the agent without its
+team; and that a branch name containing `$(...)` could execute when the printed
+recipe was pasted.
+
+**How verified:** syntax on both Bashes. A sandbox scenario driver with fake
+agents (110 checks), run on both Bashes: in-place and `wt` launch flags; the
+scaffold hidden during the session and gone after; the exclude file
+byte-identical; a tracked `.claude/agents` file untouched; the signal paths;
+exit status 7 propagated; parser orders; the printed recipe executed verbatim,
+including the `.envrc` `rm` line; quoting with a hostile branch name. Suites,
+on the final tree: codex-launch 32/32 and direnv-worktree 99/99 on both Bashes.
+
+**Follow-ups:**
+- On Bash 5.3 a second Ctrl-C can interrupt `cleanup_scaffold` (5 of 24
+  tries). Not fixed here; a separate commit will address it.
+
+**Commits:** the `refactor(cli):` commit that carries this entry.
+
 ## 2026-10-13 — Installer: one link, no direnv install, the caller's `PATH`
 
 **What:** `install.sh` installs one symlink, `<bin-dir>/<name>` -> `<prefix>/ai`;
