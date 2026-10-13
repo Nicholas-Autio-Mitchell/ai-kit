@@ -6,6 +6,8 @@ branch, or inside a throwaway **git worktree**.
 
 ```
 ai [wt|here] [claude|codex] [options] [--] [prompt...]
+ai worktrees [--fix]
+ai update [--check] [--via brew|standalone] [claude|codex]
 ```
 
 Both the mode and the agent are optional, so the shortest useful form is just:
@@ -80,6 +82,12 @@ dozen worktrees is not read-only.
 `--fix` applies the repairs: prune dead registrations, consolidate `NESTED`
 trees, and re-link / re-allow `.envrc` everywhere. `STRAY` and `DEEP` trees are
 never moved automatically.
+
+**Update (`update`)** — `ai update` upgrades the **agent CLIs** (`claude`,
+`codex`). It runs no agent and needs no repository, and it is the only part of
+this package that makes a network call. Full detail in *Updating the agent CLIs*
+below. It is not how you upgrade **ai-kit**: for that, `git pull &&
+./install.sh -y` in your clone. The two share no command and no machinery.
 
 ## Worktrees all land in one place
 
@@ -298,12 +306,14 @@ For an unknown model without a
 usable catalogue entry, set `AGENT_CODEX_EFFORT` explicitly; the launcher stops
 with guidance instead of guessing. An explicit effort override takes precedence.
 
-The launch contract was checked against **Codex CLI 0.154.0**, listed in the
-[official September 9, 2026 changelog](https://learn.chatgpt.com/docs/changelog).
-That CLI's bundled catalogue and the local cache inspected on September 12,
-2026 advertise Astra `ultra` as maximum reasoning and delegation effort. The
-checks cover CLI argument parsing and assembled instructions, without sending
-an inference request.
+The launch contract was first checked against **Codex CLI 0.154.0**, listed in
+the [official September 9, 2026 changelog](https://learn.chatgpt.com/docs/changelog),
+and **re-verified against 0.162.1 on October 12, 2026**: every flag the launcher
+passes — `--dangerously-bypass-approvals-and-sandbox`, `--search`, `--enable`,
+`-c`, `-m`, `-C` — still exists on that release. The bundled catalogue and the
+local cache inspected on September 12, 2026 advertise Astra `ultra` as maximum
+reasoning and delegation effort. The checks cover CLI argument parsing and
+assembled instructions, without sending an inference request.
 
 `AGENT_CODEX_TIER=fast` is the default. Set `AGENT_CODEX_TIER=` to omit the tier
 override and inherit your Codex configuration. This is useful when your account
@@ -380,12 +390,14 @@ settings.
 ```
 ai [wt|here] [claude|codex] [options] [--] [prompt...]
 ai worktrees [--fix]
+ai update [--check] [--via brew|standalone] [claude|codex]
 
 modes:
   (default)          work in place, on the current branch
   wt                 work in a fresh worktree + branch
   here               work in place, on the current branch
   worktrees          audit this repo's worktrees + direnv (no agent)
+  update             upgrade the agent CLIs (no agent, no repository needed)
 
 agents:
   claude (default)   latest Opus, --effort max, ultracode
@@ -399,6 +411,9 @@ options:
   -n, --name NAME    session label (both modes); under 'wt' it also names the
                      branch/worktree, defaulting to a slug of the prompt
       --fix          'worktrees' only: apply the repairs instead of listing them
+      --check        'update' only: report what is behind and change nothing
+      --via METHOD   'update' only, and one named tool only: assert how that CLI
+                     was installed (brew | standalone) instead of detecting it
   -h, --help         full help: modes, examples, environment overrides
 
 examples:
@@ -412,17 +427,22 @@ examples:
   claude-wt --name rate-limiter "Add a rate limiter"
   ai codex -- "- refactor the failing test"   # -- ends option parsing
   ai worktrees                  # audit; --fix to consolidate and re-bless
+  ai update --check             # are claude and codex current? changes nothing
+  ai update codex               # upgrade just codex, if it is behind
 ```
 
 `-h`/`--help` prints the full manual on stdout (pipe it to `less`); a mistyped
 flag prints only a short usage hint on stderr.
 
-The bare words `wt`, `here`, `worktrees`, `claude` and `codex` are only recognized
-while they *lead* the argument list — everything from the first other word on is
-the prompt.
+The bare words `wt`, `here`, `worktrees`, `update`, `claude` and `codex` are only
+recognized while they *lead* the argument list — everything from the first other
+word on is the prompt.
 So `ai claude wt ...` keeps `wt` in the prompt, and a task that genuinely
 starts with one of those words just needs quoting:
 `ai 'codex is failing to build'` runs Claude on that prompt.
+
+`update` gets a sharper rule than the rest, because it is also ordinary English:
+see *When `update` is a subcommand and when it is a prompt* below.
 
 ### No-prompt (interactive) mode
 
@@ -449,6 +469,282 @@ The flag is probed for before it is passed, so a Claude CLI too old to have it
 degrades to a note rather than refusing to start. Codex has no launch-time
 equivalent — it names sessions from inside the TUI — so `ai` says so and suggests
 its `/name` command.
+
+## Updating the agent CLIs (`ai update`)
+
+```
+ai update [--check] [--via brew|standalone] [claude|codex]
+```
+
+This upgrades the **agent CLIs** — the `claude` and `codex` binaries. It is not
+how you upgrade **ai-kit**; that is `git pull && ./install.sh -y` in your clone,
+and the two share no command and no code path.
+
+With no argument it looks at both CLIs and upgrades whichever is behind. Name
+one to narrow it. `--check` makes the whole run read-only. It runs no agent, and
+it is dispatched before the launcher's repository lookup, so it works from any
+directory — no repository required.
+
+```bash
+ai update --check              # report only; changes nothing
+ai update                      # upgrade whichever CLI is behind
+ai update codex                # just that one
+ai update claude --via brew    # assert the method when detection cannot tell
+```
+
+Three things it never does, in any path: **use sudo** (not even offered),
+**install a CLI you do not already have**, and **run `claude install`** — which
+would lay a second, native installation down beside a package-managed one.
+
+### What it drives, and what it only reports
+
+Exactly two methods are upgraded — Homebrew, in either of its package flavours,
+and the CLI's own installer:
+
+| Installed via | Reported as | `ai update` runs |
+|---|---|---|
+| Homebrew cask | `brew-cask:<token>` | `brew upgrade --cask -- <token>` |
+| Homebrew formula | `brew-formula:<name>` | `brew upgrade --formula -- <name>` |
+| The CLI's own install script | `native`, or `native:<channel>` for Claude | `claude update` / `codex update` |
+
+Everything else is detected, named in the report, and left alone, with the
+command you can run yourself:
+
+| Installed via | Reported as | Why not |
+|---|---|---|
+| npm, pnpm, yarn or bun global | `npm-global:<pkg>` | four managers with four global roots, four upgrade verbs and four failure modes; getting any of it wrong installs a *second* copy beside the one you have |
+| apt / dnf / apk | `unknown` | needs root, and there is no sudo here |
+| Outside `$HOME`, claimed by no Homebrew | `unknown` | neither drivable method owns it |
+
+**Why only two.** They are the two that can be driven correctly *and verified*.
+Reporting is cheap and cannot install a duplicate CLI; a half-right upgrade
+driver can.
+
+**Why Homebrew is driven directly** rather than delegated to the CLI's own
+updater: a Homebrew-managed Claude answers `claude update` with "Claude is up to
+date!" and changes nothing, and Codex's own updater recognises Homebrew only by
+testing whether the executable path starts with `/opt/homebrew` or `/usr/local`
+on macOS — so a Linuxbrew or non-default-prefix install falls through to "could
+not detect the installation method" and bails.
+
+### How an installation is classified
+
+Per tool, in this order:
+
+1. **The binary.** `AI_KIT_CLAUDE_BINARY` / `AI_KIT_CODEX_BINARY` if set,
+   otherwise `command -v`. An override must be a *path*, not a bare name, and
+   must be executable; set-but-unusable is a hard error for that tool and
+   **never** a fall back to `PATH`. Someone who names one binary must not get a
+   different one upgraded.
+2. **Resolve symlinks** to the real file.
+3. **Homebrew — first, on every platform.** The containment test is every tree
+   brew itself reports: `brew --prefix`, `brew --cellar`, `brew --caskroom`.
+   Never a hardcoded or inferred root, which is why Homebrew at *any* prefix
+   works for free: `/opt/homebrew`, `/usr/local`, Linuxbrew at
+   `/home/linuxbrew/.linuxbrew`, a per-user `~/.linuxbrew`, or an arbitrary
+   prefix with spaces in it. On a machine with more than one brew, the one that
+   *owns* the binary is the one that upgrades it.
+4. Under a `node_modules/` → `npm-global`. Reported, never touched. The four
+   Node package managers are deliberately not told apart: the answer would
+   change nothing, and asking would require node to be installed just to produce
+   a message.
+5. Under `$HOME` → `standalone`.
+6. Otherwise → `unknown`. Reported, never touched.
+
+Step 3 must precede step 5, and that ordering is the whole reason this works on
+Linux: a per-user Linuxbrew lives *inside* `$HOME`, so a `$HOME`-first ladder
+classifies it as a native install and then runs `claude update` — which a
+Homebrew-managed Claude ignores while reporting success.
+
+For Claude the release **channel** matters, because comparing a stable-channel
+user against `latest` nags them forever. Under Homebrew the cask token is the
+channel (a token ending in `@latest` tracks latest, anything else stable);
+otherwise it is read from `claude doctor`. `AGENT_UPDATE_CHANNEL=stable|latest`
+forces it. Codex has one channel, so its doctor is never called.
+
+### Reading the report
+
+The whole plan is printed — including the rows it refuses to act on — before the
+first byte is downloaded:
+
+```
+checking:  claude, codex
+mode:      check only (nothing will be changed)
+
+  TOOL   INSTALLED LATEST  VIA             STATUS
+  claude 2.1.296   2.1.296 native:latest   current
+  codex  0.162.1   0.162.1 brew-cask:codex current
+
+Everything is up to date.
+```
+
+| STATUS | Means |
+|---|---|
+| `current` | installed matches the latest version found |
+| `ahead` | installed is newer than anything found; left alone |
+| `OUTDATED` | behind, and `ai update` can drive the upgrade |
+| `OUT OF DATE (not touched)` | behind, but installed by a method that is only reported |
+| `unknown` | the latest version could not be determined |
+| `NOT INSTALLED` | no such binary — and ai-kit will not install one |
+| `BROKEN` | the binary, or an `AI_KIT_*_BINARY` override, does not resolve to an executable file |
+
+`VIA` is the only column allowed to overflow, so it is middle-ellipsised into
+whatever is left of 80 columns (`npm-global:@.../claude-code`). Nothing is lost:
+every row that is cut is repeated in full in the explanation printed beneath the
+table, which is also where the pasteable command lives.
+
+After a real upgrade the tool **re-reads `--version` and reports the outcome**,
+not the prediction. A command that exits 0 without changing the version is a
+failure, not a win — almost always a second copy earlier on your `PATH`, which
+it then lists for you. If the version cannot be read at all afterwards, it says
+so rather than claiming success.
+
+### Exit codes
+
+| Exit | Meaning |
+|---|---|
+| `0` | nothing left to do: everything current, ahead, or successfully upgraded |
+| `1` | something actionable and unresolved — out of date (including the rows it refuses to touch), an upgrade that failed, a CLI not installed, or a broken binary |
+| `2` | usage error |
+| `3` | the latest version could not be determined for at least one tool, and nothing else was actionable |
+
+Precedence is `2 > 1 > 3 > 0`. `3` exists so that `ai update --check && deploy`
+cannot go green on a plane: "I could not find out" is reported as its own
+answer, never as "up to date".
+
+### When `update` is a subcommand, and when it is a prompt
+
+`update` is the one bare word that also reads as ordinary English, so it does
+not use the plain "a leading bare word wins" rule. The split is structural: bare
+words are prompt material — that is this CLI's entire premise — whereas flags
+never are, since the parser already rejects any unknown `-*`. So **one
+recognised update flag commits the whole line to the subcommand**, and from
+there strictness is free:
+
+```
+ai update                          -> the subcommand
+ai update --check codex            -> the subcommand
+ai update the README to mention X  -> a prompt; the agent runs
+ai update codex extra              -> a prompt (words only)
+ai update --check extra            -> error: 'extra' after a flag
+```
+
+A `--` after `update` is literal prompt text, exactly as it is in
+`ai fix -- the bug`: by then the line has already been classified as a prompt,
+and `--` only ends option parsing in leading option position. So
+`ai update -- the README` is the prompt `update -- the README`. To force a
+prompt either way, quote it or put `--` first:
+
+```bash
+ai -- update anything
+ai 'update anything'
+```
+
+After an agent word it is always prompt text, like every other bare word:
+`ai codex update` runs Codex on the prompt "update".
+
+**The `*-wt` wrappers do not reach the subcommand**, and nothing tries to rescue
+them — they pass `wt` themselves, so their argument order decides what `update`
+means first:
+
+| You type | It becomes | What happens |
+|---|---|---|
+| `codex-wt update` | `ai wt --agent codex update` | the agent is already set, so `update` is **prompt** text: an ordinary worktree launch on the prompt "update" (outside a repository, the worktree check rejects it first) |
+| `agent-wt update` | `ai wt update` | no agent yet, so `update` **is** the subcommand — and the bare `wt` then fails the guard: *"'update' runs no agent and cuts no worktree; drop 'wt'/'here'."* |
+
+Updating the CLIs from a worktree wrapper is not a thing. Run `ai update`.
+
+### Forcing the method, pinning the binary
+
+`--via brew|standalone` overrides the classification **and nothing else**. It
+applies to one named tool (`ai update claude --via brew`), because asserting a
+method for "whatever you find" is not an assertion. `--via brew` with no usable
+Homebrew is an error rather than a guess. `--via standalone` relaxes exactly one
+refusal — "outside `$HOME` means unknown", which is precisely the claim you are
+making — and relaxes neither the no-sudo rule nor the ban on `claude install`.
+Neither form can conjure a binary: a missing or broken install stays as the
+ladder found it and is reported, not repaired.
+
+`AI_KIT_CLAUDE_BINARY` / `AI_KIT_CODEX_BINARY` point the whole run — detection,
+version read, upgrade and post-upgrade verification — at one specific binary:
+
+```bash
+AI_KIT_CODEX_BINARY=/opt/x/bin/codex ai update codex
+```
+
+### Network, offline, and timeouts
+
+**`ai update` is the only part of this package that makes a network call.** One
+release lookup per CLI, plus whatever Homebrew does on its own:
+
+- Claude: `downloads.claude.ai/claude-code-releases/<channel>`, falling back to
+  the npm registry's `dist-tags` document.
+- Codex: the npm registry's `dist-tags` document.
+- Either, under Homebrew: `brew outdated --json=v2` instead.
+
+The registry is read **only as a version oracle**, over plain HTTPS. The `npm`
+binary is never invoked and node is never required — do not read those URLs as
+npm support. Every response body is capped (64 KB) and every version string is
+validated before it can reach the report, so an error page, a captive-portal
+redirect or a region block degrades to `unknown` rather than being mined for
+digits.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AI_UPDATE_OFFLINE` | `0` | `1` suppresses every version lookup — ai-kit's HTTP and the `brew outdated` call alike; each then reports `unknown` |
+| `AGENT_UPDATE_TIMEOUT` | `900` | seconds a mutating upgrade may run before it is killed; `0` removes the clock |
+| `AGENT_UPDATE_CHANNEL` | *(empty)* | force Claude's channel: `stable` or `latest` |
+| `AI_UPDATE_FETCH_CMD` | *(empty)* | **test seam.** A command line handed the URL as its last argument, which must print the body. It replaces the HTTP client entirely. `AI_UPDATE_OFFLINE=1` is how you say "no network" |
+
+A Homebrew prefix that is not the default **cannot use bottles and builds from
+source**, which legitimately runs past fifteen minutes. That is what
+`AGENT_UPDATE_TIMEOUT=0` is for, and the timeout message says so. When a timeout
+does fire, the run reports that the upgrade may or may not have finished — it
+does not guess.
+
+Without `curl` or `wget` (and without `AI_UPDATE_FETCH_CMD`), every lookup
+degrades to `unknown`, which the report states plainly.
+
+> **`AI_UPDATE_OFFLINE=1` covers the whole subcommand, not just our own HTTP.**
+> It gates ai-kit's fetch seam *and* the `brew outdated --json=v2` lookup, because
+> brew is a separate program that refreshes its tap on its own schedule — gating
+> only the former would have let the flag go quiet on a native install while a
+> brew-managed one still reached out. Every suppressed lookup degrades to
+> `unknown`, never to a guess, which is what makes the stronger claim safe.
+>
+> It stops *lookups*, not upgrades: `ai update` offline reports `unknown` and
+> changes nothing, but an explicit `--via` upgrade still runs its package
+> manager, which will of course use the network.
+
+### Where the code lives
+
+`agent.d/lib/update.sh`, sourced **lazily** — only once `bin/ai`'s argument
+grammar has already decided this run is an `update` subcommand. That is
+load-bearing rather than tidy: `bin/ai` runs under `set -euo pipefail`, so a
+truncated or syntactically broken lib sourced eagerly would abort *every* agent
+launch. Sourced there, the worst it can do is degrade `ai update` to a clean
+exit 2. The grammar itself therefore stays in `bin/ai` and never moves into the
+lib.
+
+### `ai update` regression tests
+
+```bash
+agent.d/tests/update.sh
+UPDATE_TEST_BASH=/bin/bash agent.d/tests/update.sh      # pick a Bash
+agent.d/tests/update.sh -v -k linuxbrew                 # unittest arguments
+```
+
+Offline: the agent CLIs, Homebrew, `sudo` and the network seam are all fakes,
+and neither `curl` nor `wget` is ever placed on the fixture `PATH`. Containment
+is the point of the file — an early manual test upgraded the developer's real
+Codex CLI — so four independent guards each suffice on their own: `uname`
+answers `Linux` so the Homebrew PATH preference never engages, `platform.sh` is
+replaced with a neutered fixture, the fixture `PATH` is built only from
+explicitly symlinked utilities with the host `PATH` never appended, and every
+fake logs its argv so the suite can fail any run that names a real prefix. The
+fake `sudo` log must be empty in every single test, and the module fingerprints
+the host's real `claude`/`codex`/`brew` before the first test and fails the run
+if any of them moved.
 
 ## In-place mode leaves no trace
 
@@ -556,6 +852,17 @@ names are still honored as fallbacks.
 | `AGENT_NO_AGENTS=1`             | skip the bundled team, its directive, and Codex feature enabling       |
 | `AGENT_NO_GPG_SIGN`             | `1` (default): commits unsigned, scoped to the run; `0` keeps signing    |
 
+`ai update` only — see *Updating the agent CLIs* above for the detail:
+
+| Variable                        | Default                                                                 |
+|---------------------------------|-------------------------------------------------------------------------|
+| `AGENT_UPDATE_TIMEOUT`          | `900` seconds per mutating upgrade; `0` removes the clock (source builds) |
+| `AGENT_UPDATE_CHANNEL`          | empty — force Claude's release channel: `stable` or `latest`             |
+| `AI_UPDATE_OFFLINE`             | `0` — `1` makes `update` touch no network at all                         |
+| `AI_UPDATE_FETCH_CMD`           | empty — **test seam**: replaces the HTTP client entirely                  |
+| `AI_KIT_CLAUDE_BINARY`          | empty — inspect and upgrade *this* binary; set-but-unusable is an error, never a `PATH` fallback |
+| `AI_KIT_CODEX_BINARY`           | empty — as above, for `codex` (`AI_KIT_`, not `AGENT_`, by request)       |
+
 ## Customizing the team
 
 The canonical agent definitions live in `agent.d/agents/*.md` (standard Claude
@@ -591,7 +898,12 @@ Installed payload — self-contained, versioned, and never on your `PATH`:
     ├── codex-agents/        # 7 Codex subagents (.toml) -> .codex/agents/
     │   ├── architect.toml   precision-coder.toml   critic.toml   chronicler.toml
     │   └── test-engineer.toml   researcher.toml   security-auditor.toml
-    └── tests/               # Codex launch and direnv regression suites
+    ├── lib/                 # sourced by the launcher
+    │   ├── platform.sh      # macOS Homebrew tool preference
+    │   ├── paths.sh         # ai_realpath — the only symlink resolver allowed
+    │   ├── dependencies.sh  # installer-side package-manager handling
+    │   └── update.sh        # 'ai update'; sourced lazily, only for that run
+    └── tests/               # install, dependencies, Codex launch, direnv, update
 ```
 
 Only symlinks land in a directory on your `PATH`:
@@ -643,6 +955,9 @@ tools produce installation guidance. GNU coreutils are not required.
 - **direnv 2.33+**: the installer ensures this dependency is available. A direct
   source-checkout launch without direnv reports that no environment was loaded.
   `AGENT_DIRENV=0` remains an explicit per-run opt-out.
+- `curl` or `wget` (optional): used by `ai update` alone, and by nothing else in
+  the package. Without either, every version lookup degrades to `unknown` and
+  the report says so.
 - git `user.name` / `user.email` set globally — the chronicler commits.
 - **Credentials are per-machine and ship with nothing here.** Run `claude` then
   `/login`, and `codex login`, on each new machine.
@@ -650,3 +965,9 @@ tools produce installation guidance. GNU coreutils are not required.
   — but only run them on tasks/repos you trust. In-place mode has **no isolation
   at all**: the agent edits your real working tree and can commit to your current
   branch. Prefer `wt` when the task is risky, exploratory, or long-running.
+- `ai update` is the **only** part of this package that makes a network call,
+  and `AI_UPDATE_OFFLINE=1` removes even that. It never uses sudo, never
+  installs a CLI you do not already have, and never runs `claude install`.
+- **Python is required for the install, dependency, Codex-launch and update test
+  suites** (the direnv suite is pure Bash, and also needs `direnv`). None of
+  them is needed to use the tool.

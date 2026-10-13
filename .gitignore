@@ -6,7 +6,12 @@
 # The launcher already hides and removes these, but belt and braces.
 /.claude/agents/
 /.codex/agents/
-/DEVLOG.md
+
+# /DEVLOG.md was listed here while the only DEVLOG.md this repo ever saw was a
+# session scaffold, which would otherwise have shown up as noise. The repo now
+# keeps a real logbook, so it is tracked. Nothing has to guard it: the launcher
+# copies the scaffold only when no DEVLOG.md exists, and removes it only while it
+# is still byte-identical to agent.d/DEVLOG.template.md (bin/ai:1423, bin/ai:1510).
 
 # Editor / OS noise
 *.swp
