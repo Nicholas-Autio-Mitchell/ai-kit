@@ -12,6 +12,54 @@ Conventions:
 
 ---
 
+## 2026-10-13 — Remove `ai update` and the Claude auto-update override
+
+**What:** Removed `ai update` (`agent.d/lib/update.sh`, its 90-test offline
+suite `agent.d/tests/update.{py,sh}`, both CI steps) and the launcher's Claude
+auto-update override: `AGENT_CLAUDE_AUTOUPDATE` is gone, and `bin/ai` no longer
+sets `DISABLE_AUTOUPDATER` or `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE`. Done by
+reverting 93647d3, 2ce6459 and ef4b778; their 2026-10-12 entries below are kept
+as history.
+
+**Why:** The owner re-scoped the project. Users bring their own `claude` /
+`codex` CLI and own its install, version, updates and login; ai-kit only runs
+the command on `PATH` and supplies the seven-agent team, the best-model /
+max-effort / no-prompt defaults, and the git worktree features. A launcher that
+upgrades a CLI it does not own, or suppresses that CLI's upgrades, contradicts
+that.
+
+The trigger: a user saw
+`.../lib/update.sh: line 11: <pid> Killed: 9 ( waited=0; while ... )` during
+`ai update --check`. Root cause (verified against the bash 3.2.57 and 5.3
+sources, and reproduced): `_ai_run_timeout`'s EXIT trap SIGKILLs the
+1-second-polling watchdog after every sub-second command and then runs a bare
+`wait`, which by POSIX leaves the most recent background job's status
+unreported; bash announces it when the parser reads the trap string's next
+line, after `wait 2>/dev/null` has been undone. On bash 5.3 only the unsilenced
+call sites (the HTTP fetch, the mutating upgrade) showed it, on 35-90% of
+calls; on bash 3.2 inside `$( )` the EXIT trap even runs with the caller's
+original stderr restored, so the "silenced" sites leaked too. Removing the
+feature removes the bug.
+
+**How verified:** `bin/ai`, `agent.d/lib`, `agent.d/tests` and the CI workflow
+are now byte-identical to 354fb77, the commit before `ai update` landed. All
+remaining suites pass under `/bin/bash` 3.2.57 and Homebrew bash 5.3.20, re-run
+independently before this commit: install 16, dependencies 25, codex-launch 20,
+direnv-worktree 82 passed / 0 failed. `grep` finds no `update.sh`,
+`AGENT_UPDATE_*`, `AI_UPDATE_*`, `AI_KIT_*_BINARY` or `AUTOUPDATE` left in code,
+tests or CI; only the two READMEs still mention them.
+
+**Follow-ups:**
+- `bin/ai`'s `direnv_run` uses the same watchdog + EXIT-trap idiom. On bash 3.2
+  its call inside `$( ... 2>/dev/null )` in `direnv_allowed` can print the same
+  kind of notice (reproduced 18/20 on 3.2, 0/20 on 5.3).
+- `README.md` and `agent.d/README.md` still describe `ai update` and
+  `AGENT_CLAUDE_AUTOUPDATE` until the README milestone rewrites them.
+
+**Commits:** the `revert:` commit that carries this entry.
+
+---
+
 ## 2026-10-12 — Stop Claude self-upgrading mid-session
 
 **What:** `bin/ai` now sets `DISABLE_AUTOUPDATER=1` and

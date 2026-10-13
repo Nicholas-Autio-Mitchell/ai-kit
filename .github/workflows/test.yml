@@ -33,13 +33,11 @@ jobs:
         env:
           INSTALL_TEST_BASH: /bin/bash
           DEPENDENCY_TEST_BASH: /bin/bash
-          UPDATE_TEST_BASH: /bin/bash
         run: |
           agent.d/tests/install.sh
           agent.d/tests/dependencies.sh
           agent.d/tests/codex-launch.sh
           agent.d/tests/direnv-worktree.sh
-          agent.d/tests/update.sh
       - name: Test Homebrew Bash
         if: runner.os == 'macOS'
         shell: /bin/bash {0}
@@ -47,7 +45,5 @@ jobs:
           brew install bash
           export INSTALL_TEST_BASH="$(brew --prefix)/bin/bash"
           export DEPENDENCY_TEST_BASH="$INSTALL_TEST_BASH"
-          export UPDATE_TEST_BASH="$INSTALL_TEST_BASH"
           agent.d/tests/install.sh
           agent.d/tests/dependencies.sh
-          agent.d/tests/update.sh
