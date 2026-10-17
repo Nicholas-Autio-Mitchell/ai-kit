@@ -12,6 +12,139 @@ Conventions:
 
 ---
 
+## 2026-10-17 — The installed commit is the version; a dirty clone is refused
+
+**What:** The commit replaces the version number. `<prefix>/manifest` now
+records:
+
+- `commit=` the full SHA, or `<sha>-dirty`, or `unknown`;
+- `commit_date=` the committer date (ISO 8601);
+- `source=` the clone's path.
+
+The `version=` line and the `VERSION` file are gone. An upgrade deletes the
+old payload's `VERSION`.
+
+`install.sh` refuses unless `REPO` is the top of its own git clone
+(`rev-parse --is-inside-work-tree` is `true` and `--show-prefix` is empty) with
+a `HEAD`, and `git status --porcelain --untracked-files=normal` is empty. It
+lists up to 10 changes ("(and N more)") and suggests `git stash -u` or
+`--allow-dirty`. `--allow-dirty` installs the working tree, recorded as
+`<sha>-dirty`. It also installs a source that is not a clone (e.g. a ZIP),
+recorded as `unknown`. When a non-clone is refused, the run shows git's first
+error line and mentions `safe.directory`.
+
+A clean install is laid down from the commit itself:
+`git archive --output=<tmp>/payload.tar <commit> -- agent.d bin/ai uninstall.sh`,
+extracted in a `mktemp` directory. An EXIT trap removes the staging directory,
+and the INT/TERM/HUP traps exit through it. All of this happens before the old
+payload is removed, so a failure leaves the existing install intact. The record
+is therefore exact: ignored, sparse and skip-worktree files cannot ride along.
+
+Hardening:
+
+- `install.sh` unsets `git rev-parse --local-env-vars` (`GIT_DIR`,
+  `GIT_WORK_TREE`, ...) before it uses git.
+- The commit date is read with `--no-show-signature`. It must be one printable
+  line, otherwise it is recorded as `unknown`.
+- Control characters are refused in the clone path, the prefix, the command
+  directory and the command name.
+
+Re-run output: `reinstalling <short> (already installed)` for the same clean
+commit, otherwise `upgrading <old> -> <new>`. A legacy manifest shows as
+`version 1.0.0`.
+
+`ai --version` / `-V` prints the manifest's commit, committed date, install
+time and source. It strips control characters and takes the first match per
+key. Run from a source checkout (`bin/` under the top of its own clone), it
+prints `HEAD`, plus `-dirty` as `install.sh` would judge it.
+
+Docs: the README's upgrade section gains a paragraph on commit-as-version, the
+clean-tree rule, installing from the commit, `--allow-dirty` and ZIP sources.
+The README also now says to commit after editing agents. `install.sh --help`
+documents `--allow-dirty`. `.gitignore` adds `.DS_Store`, `__pycache__/` and
+`/.claude/settings.local.json`, because untracked files now block an install.
+
+Tests now install from a clean git clone of the working tree. `clean_clone`
+builds it once per worker from the tracked and the untracked-but-not-ignored
+files, keeping modes, recreating symlinks, and running git with a sanitised
+environment. So the developer's dirty tree does not fail the tests, and CI
+still installs from its own clean checkout.
+
+**Why:** The owner wants to know exactly which commit is installed on each
+machine. A hand-bumped `VERSION` does not do that: it was still `1.0.0` after
+many changes (see the follow-up in the entry below). The owner also wants a
+clean status required, so that no install is an unnamed mix of a commit and
+local edits. Asked explicitly, the owner chose three things: record the commit
+in the installed manifest, not in a gitignored file in the clone; refuse a
+dirty tree but allow an `--allow-dirty` override; and remove `VERSION`.
+
+Alternatives weighed:
+
+- A gitignored record in the clone. Rejected: it duplicates the manifest and
+  can disagree with it (several clones, an uninstall), and tests and CI would
+  write it.
+- Always refuse, with no override. Rejected: it blocks the README's
+  edit-agents-then-reinstall loop and the test suite.
+- Warn only. Rejected: the record would lie.
+- Copy the working tree after a clean `git status`. Rejected after review: files
+  git ignores (e.g. `agent.d/__pycache__`, `.DS_Store`, a globally ignored
+  work-in-progress agent) were installed while the commit was claimed exact.
+  Hence `git archive`.
+- A `git archive | tar` pipe. Replaced by `--output` to a file: BSD tar stops
+  reading at the end-of-archive marker, and git, still writing its padding,
+  died of SIGPIPE (exit 141) under `pipefail`. This showed up as intermittent
+  test failures, now fixed.
+- Comparing `realpath` with `--show-toplevel`. Replaced by `--show-prefix`,
+  because the comparison failed on macOS's case-insensitive paths.
+
+**How verified:** `agent.d/tests/install.sh` has 41 tests, 12 of them new. The
+test-engineer reported them passing repeatedly (3+ runs each) under Homebrew
+bash 5.3 and `/bin/bash` 3.2, with codex-launch (32) and direnv-worktree (99)
+also passing under 3.2. The new tests cover:
+
+- the manifest records commit, date and source, and `--version`/`-V` print
+  them;
+- a source checkout's `--version` shows `HEAD`, and `-dirty` when dirty;
+- reinstall vs. upgrade `A -> B` after a new commit;
+- upgrading a legacy versioned manifest removes `VERSION`;
+- modified and untracked files are refused; `--allow-dirty` records `-dirty`;
+- a non-clone and a copy nested in another repository are refused;
+  `--allow-dirty` records `unknown`;
+- ignored files are not installed (the archive);
+- an ssh-signed `HEAD` with `log.showSignature` gives a one-line date;
+- inherited `GIT_DIR`/`GIT_WORK_TREE` are ignored;
+- an upper-case path on macOS is accepted;
+- a long change list is cut short with "(and 2 more)".
+
+With each fix reverted in turn, the archive, signature, `GIT_DIR` and case tests
+failed. A manual check in a scratch `HOME` showed that a dirty real clone is
+refused with a list, `--allow-dirty` installs it, and `ai --version` prints the
+record. The chronicler re-ran `agent.d/tests/install.sh` on the final tree
+before committing: 41/41 OK under Homebrew bash 5.3.15 and under `/bin/bash`
+(`INSTALL_TEST_BASH=/bin/bash`), run at the same time.
+
+Review:
+
+- The critic's first round asked for revision: B1 (signature in the date), S1
+  (case), S2 (`GIT_DIR`), S3 (ignored files) and S4 (error message). It
+  approved after the fixes. Its nits were applied: the header wrap, TERM/HUP
+  cleanup, the `= true` check, and an empty legacy version.
+- The security-auditor's M1 (archive), M2 (signature) and L1–L5 were adopted,
+  and it approved. One more hardening step was adopted: the temporary directory
+  has its own variable, so the trap can never target the clone.
+
+**Follow-ups / known limits:**
+- `upgrading` is also printed for a downgrade.
+- An install from a source with repo-local git config runs that config's
+  programs during `status`/`archive`. That is the same trust as running
+  `install.sh`.
+- With `core.autocrlf=true` the installed files get CRLF line endings, as they
+  did with the working-tree copy.
+- A non-clone `--allow-dirty` install writes an empty `commit_date=` line;
+  `ai --version` omits it.
+
+**Commits:** the `feat(install):` commit that carries this entry.
+
 ## 2026-10-17 — A re-run upgrades the existing install instead of the defaults
 
 **What:** `install.sh` now finds the existing install and takes its recorded
@@ -101,7 +234,8 @@ user owns, as same-user behaviour.
 **Follow-ups:**
 - `VERSION` is still `1.0.0` after many changes, so the
   `upgrading ai-kit X -> Y` line cannot show a difference. Bump `VERSION` on
-  releases.
+  releases. *(Superseded 2026-10-17: `VERSION` is gone and the installed
+  commit is the version; see "The installed commit is the version" above.)*
 
 **Commits:** the `fix(install):` commit that carries this entry.
 

@@ -33,7 +33,7 @@ REAL_READLINK = shutil.which("readlink")
 # them: users bring their own claude/codex, and direnv is optional.
 INSTALLERS = ("brew", "port", "apt-get", "apt", "dnf", "yum", "pacman", "zypper",
               "apk", "sudo", "curl", "wget")
-PAYLOAD = {"ai", "agent.d", "uninstall.sh", "VERSION", "manifest"}
+PAYLOAD = {"ai", "agent.d", "uninstall.sh", "manifest"}
 # Every command name a test installs or a re-run probes for. They are hidden
 # from PATH: a re-run finds the install behind the command PATH resolves, and a
 # test must never find (and upgrade) the user's real one.
@@ -45,6 +45,41 @@ def command(path, body):
     path.write_text("#!/bin/sh\n" + body)
     path.chmod(0o755)
     return path
+
+
+def git(directory, *args, config=()):
+    """Run git in `directory` with no user or system configuration."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    options = ["user.name=ai-kit tests", "user.email=tests@ai-kit.invalid", *config]
+    return subprocess.run(
+        [REAL_GIT, *(arg for option in options for arg in ("-c", option)),
+         "-C", str(directory), *args],
+        env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ).stdout
+
+
+def clean_clone(destination):
+    """A clean clone of this package as its working tree is now, committed.
+
+    install.sh refuses a tree with uncommitted changes, and the package under
+    test usually has some, so the tests install from this instead: the tracked
+    files and the untracked ones git does not ignore, copied with their modes.
+    """
+    listed = git(PACKAGE, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    for name in sorted(set(filter(None, listed.split("\0")))):
+        source, target = PACKAGE / name, destination / name
+        if not os.path.lexists(source):  # deleted, but still --cached
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            target.symlink_to(os.readlink(source))
+        else:
+            shutil.copy2(source, target)
+    git(destination, "init", "-q")
+    git(destination, "add", "-A")
+    git(destination, "commit", "-q", "-m", "fixture")
+    return destination
 
 
 def path_without(names, shadow_root):
@@ -77,6 +112,7 @@ class InstallTests(unittest.TestCase):
         shared = tempfile.TemporaryDirectory(prefix="ai-kit install fixtures ")
         cls.addClassCleanup(shared.cleanup)
         shared_root = Path(shared.name).resolve()
+        cls.source = clean_clone(shared_root / "source")
         cls.tools = shared_root / "tools"
         cls.tools.mkdir()
         # A symlink, not a wrapper: `#!/usr/bin/env bash` scripts (the installed
@@ -146,7 +182,7 @@ fi
 
     def install(self, *args, script=None, env=None):
         return self.run_script(
-            script or PACKAGE / "install.sh", "-y", "--prefix", self.prefix,
+            script or self.source / "install.sh", "-y", "--prefix", self.prefix,
             "--bin-dir", self.bindir, "--name", "kit", *args, env=env,
         )
 
@@ -176,6 +212,168 @@ fi
         self.assertEqual(list(self.prefix.rglob("README*")), [])
         process = self.successful(self.run_script(link, "--help"))
         self.assertIn("usage: kit ", process.stdout)
+
+    def head(self, source=None):
+        return git(source or self.source, "rev-parse", "HEAD").strip()
+
+    def own_clone(self):
+        """A copy of the clean clone this test may change."""
+        clone = self.root / "clone"
+        shutil.copytree(self.source, clone, symlinks=True)
+        return clone
+
+    def test_manifest_records_the_installed_commit_and_ai_version_shows_it(self):
+        self.successful(self.install())
+        manifest = (self.prefix / "manifest").read_text()
+        self.assertIn("commit=%s\n" % self.head(), manifest)
+        self.assertRegex(manifest, r"\ncommit_date=\d{4}-\d\d-\d\dT")
+        self.assertIn("source=%s\n" % self.source, manifest)
+        self.assertNotIn("version=", manifest)
+        for option in ("--version", "-V"):
+            with self.subTest(option=option):
+                process = self.successful(self.run_script(self.bindir / "kit", option))
+                self.assertTrue(process.stdout.startswith("ai-kit %s\n" % self.head()), process.stdout)
+                self.assertIn("from      %s" % self.source, process.stdout)
+
+    def test_source_checkout_launcher_shows_its_head(self):
+        process = self.successful(self.run_script(self.source / "bin/ai", "--version"))
+        self.assertTrue(process.stdout.startswith("ai-kit %s\n" % self.head()), process.stdout)
+        self.assertIn("source checkout", process.stdout)
+
+    def test_rerun_reports_the_commit_it_upgrades_from_and_to(self):
+        clone = self.own_clone()
+        first = self.head(clone)
+        self.successful(self.install(script=clone / "install.sh"))
+        process = self.successful(self.install(script=clone / "install.sh"))
+        self.assertIn("reinstalling %s (already installed)" % first[:12], process.stderr)
+        (clone / "agent.d/agents/critic.md").write_text("pulled\n")
+        git(clone, "commit", "-q", "-am", "a pull")
+        second = self.head(clone)
+        process = self.successful(self.install(script=clone / "install.sh"))
+        self.assertIn("upgrading %s -> %s" % (first[:12], second[:12]), process.stderr)
+        self.assertIn("commit=%s\n" % second, (self.prefix / "manifest").read_text())
+        self.assertEqual((self.prefix / "agent.d/agents/critic.md").read_text(), "pulled\n")
+
+    def test_upgrade_from_a_versioned_install_drops_the_version_file(self):
+        self.successful(self.install())
+        manifest = self.prefix / "manifest"
+        lines = [line for line in manifest.read_text().splitlines(keepends=True)
+                 if not line.startswith(("commit=", "commit_date=", "source="))]
+        manifest.write_text("".join(lines).replace("\nprefix=", "\nversion=1.0.0\nprefix=", 1))
+        (self.prefix / "VERSION").write_text("1.0.0\n")
+        process = self.successful(self.install())
+        self.assertIn("upgrading version 1.0.0 -> %s" % self.head()[:12], process.stderr)
+        self.assertEqual(set(os.listdir(self.prefix)), PAYLOAD)
+
+    def test_uncommitted_changes_are_refused_unless_allowed(self):
+        clone = self.own_clone()
+        commit = self.head(clone)
+        (clone / "editor backup~").write_text("ignored by .gitignore\n")
+        self.successful(self.install(script=clone / "install.sh"))
+        shutil.rmtree(self.prefix)
+        shutil.rmtree(self.bindir)
+        for label, change in (("modified", "agent.d/agents/critic.md"), ("untracked", "notes.txt")):
+            with self.subTest(change=label):
+                path = clone / change
+                original = path.read_text() if path.exists() else None
+                path.write_text("local edit\n")
+                process = self.install(script=clone / "install.sh")
+                self.assertEqual(process.returncode, 1, process.stderr)
+                self.assertIn("not committed", process.stderr)
+                self.assertIn(change, process.stderr)
+                self.assertIn("--allow-dirty", process.stderr)
+                self.assertFalse(self.prefix.exists())
+                self.assertFalse(self.bindir.exists())
+
+                process = self.successful(self.install("--allow-dirty", script=clone / "install.sh"))
+                self.assertIn("installing uncommitted changes", process.stderr)
+                self.assertIn("commit=%s-dirty\n" % commit, (self.prefix / "manifest").read_text())
+                # A dirty install is never "already installed": it always says so.
+                process = self.successful(self.install("--allow-dirty", script=clone / "install.sh"))
+                self.assertIn("upgrading %s-dirty -> %s-dirty" % (commit[:12], commit[:12]), process.stderr)
+                shutil.rmtree(self.prefix)
+                shutil.rmtree(self.bindir)
+                path.unlink() if original is None else path.write_text(original)
+
+    def test_a_clean_install_is_the_commit_without_the_files_git_ignores(self):
+        clone = self.own_clone()
+        (clone / "agent.d/agents/scratch.md~").write_text("an editor backup\n")
+        (clone / "agent.d/__pycache__").mkdir()
+        (clone / "agent.d/__pycache__/x.pyc").write_text("bytecode\n")
+        self.successful(self.install(script=clone / "install.sh"))
+        self.assertFalse((self.prefix / "agent.d/agents/scratch.md~").exists())
+        self.assertFalse((self.prefix / "agent.d/__pycache__").exists())
+        self.assertEqual(len(list((self.prefix / "agent.d/agents").glob("*.md"))), 7)
+        self.assertEqual((self.prefix / "ai").read_bytes(), (clone / "bin/ai").read_bytes())
+        self.assertTrue(os.access(self.prefix / "ai", os.X_OK))
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "signing a commit needs ssh-keygen")
+    def test_commit_date_is_one_line_when_git_shows_signatures(self):
+        clone = self.own_clone()
+        key = self.root / "signing key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+        git(clone, "commit", "-q", "-S", "--allow-empty", "-m", "signed",
+            config=("gpg.format=ssh", "user.signingkey=%s" % key))
+        settings = self.root / "gitconfig"
+        settings.write_text("[log]\n\tshowSignature = true\n")
+        process = self.successful(self.install(script=clone / "install.sh",
+                                               env={"GIT_CONFIG_GLOBAL": str(settings)}))
+        dates = [line for line in (self.prefix / "manifest").read_text().splitlines()
+                 if line.startswith("commit_date=")]
+        self.assertEqual(len(dates), 1)
+        self.assertRegex(dates[0], r"^commit_date=\d{4}-\d\d-\d\dT[0-9:]+[+-Z]")
+        self.assertNotIn("ignature", (self.prefix / "manifest").read_text() + process.stderr)
+
+    def test_git_variables_inherited_from_another_repository_are_ignored(self):
+        other = self.root / "other repository"
+        other.mkdir()
+        git(other, "init", "-q")
+        git(other, "commit", "-q", "--allow-empty", "-m", "other")
+        self.successful(self.install(env={"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other)}))
+        self.assertIn("commit=%s\n" % self.head(), (self.prefix / "manifest").read_text())
+
+    @unittest.skipUnless(sys.platform == "darwin", "a case-insensitive file system")
+    def test_source_path_typed_in_another_case_is_still_its_own_clone(self):
+        clone = self.own_clone()
+        if not (self.root / "CLONE").exists():
+            self.skipTest("this file system is case-sensitive")
+        self.successful(self.install(script=self.root / "CLONE" / "install.sh"))
+        self.assertIn("commit=%s\n" % self.head(clone), (self.prefix / "manifest").read_text())
+
+    def test_a_dirty_source_checkout_says_so_in_its_version(self):
+        clone = self.own_clone()
+        (clone / "notes.txt").write_text("untracked\n")
+        process = self.successful(self.run_script(clone / "bin/ai", "--version"))
+        self.assertTrue(process.stdout.startswith("ai-kit %s-dirty\n" % self.head(clone)), process.stdout)
+
+    def test_a_long_list_of_changes_is_cut_short_and_counted(self):
+        clone = self.own_clone()
+        for number in range(12):
+            (clone / ("new file %02d" % number)).write_text("untracked\n")
+        process = self.install(script=clone / "install.sh")
+        self.assertEqual(process.returncode, 1, process.stderr)
+        self.assertIn("new file 09", process.stderr)
+        self.assertNotIn("new file 10", process.stderr)
+        self.assertIn("(and 2 more)", process.stderr)
+
+    def test_a_source_that_is_not_its_own_clone_is_refused_unless_allowed(self):
+        # A plain copy, and the same copy inside some other repository: neither
+        # has a commit of its own to record.
+        outer = self.root / "outer repository"
+        copy = outer / "ai-kit copy"
+        shutil.copytree(self.source, copy, ignore=shutil.ignore_patterns(".git"))
+        for label, make_outer_repository in (("a plain copy", False), ("inside another repository", True)):
+            with self.subTest(source=label):
+                if make_outer_repository:
+                    git(outer, "init", "-q")
+                process = self.install(script=copy / "install.sh")
+                self.assertEqual(process.returncode, 1, process.stderr)
+                self.assertIn("not the top of a git clone", process.stderr)
+                self.assertFalse(self.prefix.exists())
+                self.successful(self.install("--allow-dirty", script=copy / "install.sh"))
+                self.assertIn("commit=unknown\n", (self.prefix / "manifest").read_text())
+                shutil.rmtree(self.prefix)
+                shutil.rmtree(self.bindir)
 
     def test_linux_install_and_uninstall(self):
         self.successful(self.install(env={"INSTALL_TEST_OS": "Linux"}))
@@ -226,10 +424,10 @@ fi
 
     def reinstall(self, *args, env=None):
         """Re-run install.sh -y with only `args`: the upgrade a `git pull` user runs."""
-        return self.successful(self.run_script(PACKAGE / "install.sh", "-y", *args, env=env))
+        return self.successful(self.run_script(self.source / "install.sh", "-y", *args, env=env))
 
     def assert_unchanged_install(self, process):
-        self.assertIn("upgrading ai-kit", process.stderr)
+        self.assertIn("Reusing its command", process.stderr)
         self.assertEqual(os.listdir(self.bindir), ["kit"])
         self.assertEqual((self.bindir / "kit").resolve(), self.prefix / "ai")
         self.assertEqual(self.manifest_links(), [str(self.bindir / "kit")])
@@ -256,7 +454,7 @@ fi
         self.successful(self.install())
         self.assertEqual(os.listdir(self.home / ".local"), ["share"])
         process = self.reinstall()
-        self.assertIn("upgrading ai-kit", process.stderr)
+        self.assertIn("Reusing its command", process.stderr)
         self.assertEqual(os.listdir(self.bindir), ["kit"])
         self.assertEqual((self.bindir / "kit").resolve(), self.prefix / "ai")
         self.assertEqual(self.manifest_links(), [str(self.bindir / "kit")])
@@ -267,7 +465,7 @@ fi
         self.bindir = self.home / ".local/bin"
         self.successful(self.install())
         process = self.reinstall()
-        self.assertIn("upgrading ai-kit", process.stderr)
+        self.assertIn("Reusing its command", process.stderr)
         self.assertEqual(os.listdir(self.bindir), ["kit"])
         self.assertEqual((self.bindir / "kit").resolve(), self.prefix / "ai")
         self.assertFalse((self.home / ".local/share").exists())
@@ -281,10 +479,10 @@ fi
         self.bindir = self.home / ".local/bin"
         self.successful(self.install())
         second = self.root / "second payload"
-        self.successful(self.run_script(PACKAGE / "install.sh", "-y", "--prefix", second,
+        self.successful(self.run_script(self.source / "install.sh", "-y", "--prefix", second,
                                         "--bin-dir", self.bindir, "--name", "renamed"))
         before = (self.prefix / "manifest").read_text(), (second / "manifest").read_text()
-        process = self.run_script(PACKAGE / "install.sh", "-y")
+        process = self.run_script(self.source / "install.sh", "-y")
         self.assertEqual(process.returncode, 1, process.stderr)
         self.assertIn("several ai-kit installs", process.stderr)
         self.assertIn(str(self.prefix), process.stderr)
@@ -294,19 +492,19 @@ fi
         self.prefix = self.home / ".local/share/ai-kit"
         self.successful(self.install("--name", "third"))
         process = self.reinstall()
-        self.assertIn("upgrading ai-kit", process.stderr)
+        self.assertIn("Reusing its command", process.stderr)
         self.assertIn("at %s\n" % self.prefix, process.stderr)
 
     def test_fresh_install_says_it_found_no_install_to_upgrade(self):
         process = self.reinstall()
         self.assertIn("No existing install found", process.stderr)
-        self.assertNotIn("upgrading ai-kit", process.stderr)
+        self.assertNotIn("Reusing its command", process.stderr)
         self.assertTrue((self.home / ".local/bin/ai").is_symlink())
 
     def test_moving_the_prefix_names_the_install_that_owns_the_command(self):
         self.successful(self.install())
         elsewhere = self.root / "elsewhere"
-        process = self.run_script(PACKAGE / "install.sh", "-y", "--prefix", elsewhere,
+        process = self.run_script(self.source / "install.sh", "-y", "--prefix", elsewhere,
                                   "--bin-dir", self.bindir, "--name", "kit")
         self.assertEqual(process.returncode, 1, process.stderr)
         self.assertIn("is the command of the ai-kit install at %s" % self.prefix, process.stderr)
@@ -339,7 +537,7 @@ fi
             "prefix=%s\n" % self.prefix, "prefix=%s\n" % (self.root / "elsewhere")))
         process = self.reinstall("--prefix", self.prefix)
         self.assertIn("records the prefix '%s'" % (self.root / "elsewhere"), process.stderr)
-        self.assertNotIn("upgrading ai-kit", process.stderr)
+        self.assertNotIn("Reusing its command", process.stderr)
         self.assertIn("command=ai\n", manifest.read_text())
         self.assertTrue((self.home / ".local/bin/ai").is_symlink())
 
@@ -368,10 +566,10 @@ fi
 
     def test_installer_source_resolves_relative_symlink(self):
         link = self.root / "installer link"
-        link.symlink_to(os.path.relpath(PACKAGE / "install.sh", link.parent))
+        link.symlink_to(os.path.relpath(self.source / "install.sh", link.parent))
         self.successful(self.install(script=link))
         self.assertEqual(set(os.listdir(self.prefix)), PAYLOAD)
-        self.assertEqual((self.prefix / "ai").read_bytes(), (PACKAGE / "bin/ai").read_bytes())
+        self.assertEqual((self.prefix / "ai").read_bytes(), (self.source / "bin/ai").read_bytes())
 
     def test_prefix_through_symlink_uninstalls_from_installed_copy(self):
         actual = self.root / "real parent"
@@ -439,7 +637,7 @@ fi
                     path.mkdir() if entry.endswith("/") else path.write_text("partial\n")
                 self.successful(self.install())
                 self.assertEqual(set(os.listdir(self.prefix)), PAYLOAD)
-                self.assertEqual((self.prefix / "ai").read_bytes(), (PACKAGE / "bin/ai").read_bytes())
+                self.assertEqual((self.prefix / "ai").read_bytes(), (self.source / "bin/ai").read_bytes())
                 shutil.rmtree(self.prefix)
                 shutil.rmtree(self.bindir)
 

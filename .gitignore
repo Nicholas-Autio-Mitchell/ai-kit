@@ -1,13 +1,18 @@
 # Nothing ai-kit produces belongs in git; these entries are defensive.
 
-# Session scaffolding, should an agent run in this repo (the launcher removes it).
+# Session scaffolding, should an agent run in this repo (the launcher removes it),
+# and Claude Code's per-user settings for it.
 /.claude/agents/
 /.codex/agents/
+/.claude/settings.local.json
 
 # DEVLOG.md is this repo's own logbook, so it is tracked.
 
-# Editor / OS noise
+# Editor / OS / tool noise. install.sh refuses a tree with untracked files, so
+# anything an editor, the OS or the test suite leaves behind must be ignored.
 *.swp
 *~
 .idea/
 .vscode/
+.DS_Store
+__pycache__/

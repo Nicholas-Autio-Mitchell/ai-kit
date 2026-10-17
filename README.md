@@ -26,6 +26,13 @@ install through its command (in the command directory or on your `PATH`) or at
 the default directory, and reuses its settings; an option you pass still wins.
 It says when it finds none; for an install it cannot find, pass `--prefix DIR`.
 
+The commit is the version: the install's manifest records which commit of your
+clone is installed (and when, and from where), and `ai --version` prints it. The
+installer refuses a clone with uncommitted changes or untracked files, and lays
+the install down from the commit itself, so the record is exact. `--allow-dirty`
+installs the working tree anyway, recorded as `<commit>-dirty`; it is also what a
+source that is not a git clone (a downloaded ZIP) needs, recorded as `unknown`.
+
 Requires Linux or macOS, bash (macOS `/bin/bash` 3.2 works), git 2.31+, and
 `claude` and/or `codex` on your `PATH`. Optional: direnv 2.33+, and python3
 (lets Codex pick the model's highest effort from its model catalogue).
@@ -68,7 +75,7 @@ AGENT_CLAUDE_MODEL=sonnet ai "Fix a typo"  # override a default for one run
 - **Team:** architect, researcher, precision-coder, test-engineer, critic,
   security-auditor and chronicler, installed as `.claude/agents/*.md` or
   `.codex/agents/*.toml`, hidden from `git status`, and removed when the session
-  ends. Edit them in `agent.d/`, then re-run `./install.sh`.
+  ends. Edit them in `agent.d/`, commit, then re-run `./install.sh`.
 - **Workflow:** the agent loops research → design → implement → test → review;
   the chronicler keeps `DEVLOG.md` and commits each milestone, unsigned unless
   `AGENT_NO_GPG_SIGN=0`.

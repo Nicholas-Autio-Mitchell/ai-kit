@@ -5,12 +5,16 @@ set -euo pipefail
 #
 # Lays down a self-contained payload and one symlink to it:
 #
-#   <prefix>/                      ai, agent.d/, uninstall.sh, VERSION, manifest
+#   <prefix>/                      ai, agent.d/, uninstall.sh, manifest
 #   <bin-dir>/<name>  -> <prefix>/ai
 #
-# The link is recorded in <prefix>/manifest. Nothing that is not already an
-# ai-kit link is ever replaced. Re-running upgrades in place and removes recorded
-# links it no longer creates; uninstall.sh removes exactly what is recorded.
+# The commit is the version: <prefix>/manifest records which commit of this
+# clone is installed, and the link. A tree with uncommitted changes is refused
+# (--allow-dirty installs it anyway, recorded as <commit>-dirty).
+#
+# Nothing that is not already an ai-kit link is ever replaced. Re-running
+# upgrades in place and removes recorded links it no longer creates;
+# uninstall.sh removes exactly what is recorded.
 #
 # Options: ./install.sh --help (usage() below).
 # Supports Linux and macOS, including Apple's bundled Bash 3.2 and BSD utilities.
@@ -24,8 +28,6 @@ while [ -h "$src" ]; do
 done
 REPO="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
 . "$REPO/agent.d/lib/paths.sh"
-
-VERSION="$(cat "$REPO/VERSION" 2>/dev/null || echo unknown)"
 
 # ---- Output ----------------------------------------------------------------
 if [ -t 2 ]; then
@@ -50,6 +52,8 @@ options:
                   existing install's, else ~/.local/bin)
   --name NAME     command name (default: the existing install's, else ai)
   -y, --yes       ask nothing; use the default for each setting not given
+  --allow-dirty   install a tree with uncommitted changes, or one that is not a
+                  git clone; the manifest records <commit>-dirty (or unknown)
   --uninstall     run uninstall.sh with the options that follow (--prefix DIR, -y)
   -h, --help      show this help
 
@@ -69,7 +73,7 @@ DEFAULT_PREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/ai-kit"
 DEFAULT_BIN_DIR="$HOME/.local/bin"
 DEFAULT_NAME="ai"
 
-PREFIX=""; BIN_DIR=""; CMD=""; ASSUME_YES=0
+PREFIX=""; BIN_DIR=""; CMD=""; ASSUME_YES=0; ALLOW_DIRTY=0
 
 # ---- Arguments -------------------------------------------------------------
 while [ "$#" -gt 0 ]; do
@@ -78,6 +82,7 @@ while [ "$#" -gt 0 ]; do
     --bin-dir)     [ "$#" -ge 2 ] || die "--bin-dir needs a directory"; BIN_DIR="$2"; shift 2 ;;
     --name)        [ "$#" -ge 2 ] || die "--name needs a command name"; CMD="$2";     shift 2 ;;
     -y|--yes)      ASSUME_YES=1; shift ;;
+    --allow-dirty) ALLOW_DIRTY=1; shift ;;
     --uninstall)   shift; exec "$REPO/uninstall.sh" "$@" ;;
     -h|--help)     usage; exit 0 ;;
     *)             die "unknown option: $1  (try --help)" ;;
@@ -111,7 +116,7 @@ abspath() {
 }
 
 # ---- Preflight -------------------------------------------------------------
-head_ "ai-kit $VERSION — preflight"
+head_ "ai-kit — preflight"
 
 platform="$(uname -s)"
 case "$platform" in
@@ -135,6 +140,62 @@ if [ "$git_major" -lt 2 ] || { [ "$git_major" -eq 2 ] && [ "$git_minor" -lt 31 ]
        $git_install_hint"
 fi
 ok "git $git_v"
+
+# ---- Source commit ---------------------------------------------------------
+# The commit is the version. REPO must be the top of its own clone (not a copy
+# inside some other repository), and the tree must match HEAD: anything git
+# would show in `git status` is a change the recorded commit would not describe.
+# A clean install is then laid down from the commit itself (see Installing).
+
+# Variables that point git at another repository (a hook, `rebase -x`, a
+# dotfiles alias) must not decide which commit this clone is.
+unset $(git rev-parse --local-env-vars 2>/dev/null) 2>/dev/null || true
+
+# label <commit> — the short form shown to people.
+label() {
+  local c="$1" suffix=""
+  case "$c" in *-dirty) suffix="-dirty"; c="${c%-dirty}" ;; esac
+  case "$c" in ""|unknown) printf '%s' "${c:-unknown}" ;; *) printf '%s%s' "${c:0:12}" "$suffix" ;; esac
+}
+case "$REPO" in
+  *[[:cntrl:]]*) die "the ai-kit clone's path contains control characters; move it." ;;
+esac
+COMMIT=""; COMMIT_DATE=""
+# --show-prefix is empty only at the top of the work tree; unlike comparing
+# paths, it is not fooled by a case-insensitive file system.
+if git_error="$(git -C "$REPO" rev-parse --is-inside-work-tree 2>&1 >/dev/null)" \
+   && [ "$(git -C "$REPO" rev-parse --is-inside-work-tree)" = true ] \
+   && in_repo="$(git -C "$REPO" rev-parse --show-prefix)" && [ -z "$in_repo" ] \
+   && COMMIT="$(git -C "$REPO" rev-parse --verify -q HEAD)"; then
+  # --no-show-signature: log.showSignature would print the signature check first.
+  COMMIT_DATE="$(git -C "$REPO" log -1 --no-show-signature --format=%cI HEAD)"
+  case "$COMMIT_DATE" in ""|*[![:print:]]*) COMMIT_DATE="unknown" ;; esac
+  changes="$(git --no-optional-locks -C "$REPO" status --porcelain --untracked-files=normal)"
+  if [ -n "$changes" ]; then
+    if [ "$ALLOW_DIRTY" -eq 0 ]; then
+      say "  $REPO has changes that are not committed:"
+      { printf '%s\n' "$changes" | head -10 | while IFS= read -r line; do say "      $line"; done; } || true
+      count="$(printf '%s\n' "$changes" | wc -l | tr -d ' ')"
+      [ "$count" -le 10 ] || say "      (and $((count - 10)) more)"
+      die "commit them (or git stash -u), so that the install is exactly one commit;
+       or pass --allow-dirty to install them anyway, recorded as <commit>-dirty."
+    fi
+    COMMIT="$COMMIT-dirty"
+    warn "installing uncommitted changes (--allow-dirty): recorded as $(label "$COMMIT")"
+  else
+    ok "source $(label "$COMMIT") ($COMMIT_DATE)"
+  fi
+else
+  COMMIT=""
+  if [ "$ALLOW_DIRTY" -eq 0 ]; then
+    [ -z "$git_error" ] || say "  git: $(printf '%s' "$git_error" | head -1)"
+    die "$REPO is not the top of a git clone with a commit, so the installed
+       commit cannot be recorded. Install from a clone (one owned by another user
+       must be in git's safe.directory), or pass --allow-dirty (recorded as unknown)."
+  fi
+  COMMIT="unknown"
+  warn "$REPO is not a git clone (--allow-dirty): the installed commit is recorded as unknown"
+fi
 
 have_claude=0; have_codex=0
 command -v claude >/dev/null 2>&1 && have_claude=1
@@ -263,7 +324,15 @@ if [ -n "$found" ]; then
   DEFAULT_PREFIX="$found"
   case "$prev_bin_dir" in /*) DEFAULT_BIN_DIR="$prev_bin_dir" ;; esac
   DEFAULT_NAME="${prev_cmd:-$DEFAULT_NAME}"
-  ok "upgrading ai-kit $(manifest_value "$found" version) -> $VERSION at $found"
+  prev_commit="$(manifest_value "$found" commit)"
+  if [ -n "$prev_commit" ]; then prev_label="$(label "$prev_commit")"
+  else prev_label="version $(manifest_value "$found" version)"; fi   # before commits were recorded
+  [ "$prev_label" != "version " ] || prev_label="unknown"
+  if [ "$prev_commit" = "$COMMIT" ] && [ "$COMMIT" != unknown ] && [ "${COMMIT%-dirty}" = "$COMMIT" ]; then
+    ok "reinstalling $(label "$COMMIT") (already installed) at $found"
+  else
+    ok "upgrading $prev_label -> $(label "$COMMIT") at $found"
+  fi
   say "    Reusing its command, $DEFAULT_BIN_DIR/$DEFAULT_NAME; an option overrides it."
 elif [ -z "$PREFIX" ]; then
   say "  No existing install found: installing fresh. (To upgrade one this did not"
@@ -296,7 +365,10 @@ if [ -z "$CMD" ]; then
   CMD="$(ask "Command name?" "$suggested")"
 fi
 case "$CMD" in
-  ""|*/*|*:*|*[[:space:]]*) die "invalid command name: '$CMD'" ;;
+  ""|*/*|*:*|*[[:space:]]*|*[[:cntrl:]]*) die "invalid command name: '$CMD'" ;;
+esac
+case "$PREFIX$BIN_DIR" in
+  *[[:cntrl:]]*) die "the install and command directories cannot contain control characters" ;;
 esac
 
 # ---- Work out the links, and refuse to touch anything we do not own --------
@@ -365,15 +437,34 @@ fi
 mkdir -p -- "$BIN_DIR" 2>/dev/null && [ -w "$BIN_DIR" ] \
   || die "cannot write to '$BIN_DIR'; choose a directory you own with --bin-dir."
 
+# The payload. A clean install comes from the commit itself, so the record is
+# exact by construction: nothing git ignores, and no sparse or skip-worktree
+# difference, rides along. --allow-dirty installs the working tree, as recorded.
+payload="$REPO"
+case "$COMMIT" in
+  unknown|*-dirty) ;;
+  *)
+    staging="$(mktemp -d "${TMPDIR:-/tmp}/ai-kit-install.XXXXXX")"
+    trap 'rm -rf -- "$staging"' EXIT   # never $payload: that may be the clone
+    payload="$staging"
+    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP   # each runs the EXIT trap
+    # Through a file, not a pipe: BSD tar stops reading at the end-of-archive
+    # marker, and git, still writing its padding, would die of SIGPIPE.
+    git -C "$REPO" archive --format=tar --output="$payload/payload.tar" "$COMMIT" \
+      -- agent.d bin/ai uninstall.sh
+    tar -xf "$payload/payload.tar" -C "$payload"
+    ;;
+esac
+
 # Upgrade in place: replace only the payload we lay down, never the whole prefix.
 rm -rf -- "$PREFIX/agent.d"
-rm -f  -- "$PREFIX/ai" "$PREFIX/agent-wt" "$PREFIX/claude-wt" "$PREFIX/codex-wt"  # older launchers
+rm -f  -- "$PREFIX/ai" "$PREFIX/agent-wt" "$PREFIX/claude-wt" "$PREFIX/codex-wt" \
+          "$PREFIX/VERSION"  # older launchers, and the version file the commit replaced
 mkdir -p -- "$PREFIX"
 
-cp -R -- "$REPO/agent.d" "$PREFIX/agent.d"
-cp -- "$REPO/bin/ai" "$PREFIX/ai"
-cp -- "$REPO/uninstall.sh" "$PREFIX/uninstall.sh"
-cp -- "$REPO/VERSION" "$PREFIX/VERSION"
+cp -R -- "$payload/agent.d" "$PREFIX/agent.d"
+cp -- "$payload/bin/ai" "$PREFIX/ai"
+cp -- "$payload/uninstall.sh" "$PREFIX/uninstall.sh"
 
 # Deterministic modes on the payload only: a clone inherits the cloner's umask,
 # and a payload that is not readable by the launcher is a confusing failure.
@@ -381,7 +472,6 @@ chmod 755 "$PREFIX"
 find "$PREFIX/agent.d" -type d -exec chmod 755 {} +
 find "$PREFIX/agent.d" -type f -exec chmod 644 {} +
 find "$PREFIX/agent.d" -type f -name '*.sh' -exec chmod 755 {} +
-chmod 644 "$PREFIX/VERSION"
 chmod 755 "$PREFIX/ai" "$PREFIX/uninstall.sh"
 ok "payload -> $PREFIX"
 
@@ -416,7 +506,9 @@ fi
 
 {
   echo "# ai-kit install manifest — used by uninstall.sh. Do not edit."
-  echo "version=$VERSION"
+  echo "commit=$COMMIT"
+  echo "commit_date=$COMMIT_DATE"
+  echo "source=$REPO"
   echo "installed=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "prefix=$PREFIX"
   echo "bin_dir=$BIN_DIR"

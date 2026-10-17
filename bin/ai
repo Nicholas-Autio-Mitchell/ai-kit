@@ -38,6 +38,7 @@ modes:
 options:
   -b, --base REF   base of the worktree branch (default: the current branch)
   -n, --name NAME  session name (Claude); with wt, also names the branch and worktree
+  -V, --version    show which commit of ai-kit this is
   -h, --help       show this help
 
 defaults:
@@ -137,6 +138,38 @@ CODEX_TIER="${AGENT_CODEX_TIER-fast}"
 # Explicit empty value also disables --search.
 CODEX_SEARCH="${AGENT_CODEX_SEARCH-1}"
 
+# version — which commit this is: what the install's manifest recorded or, run
+# from a source checkout (bin/ai at the top of its own clone), its HEAD, with
+# -dirty when `git status` shows anything, as install.sh judges it.
+version() {
+  local manifest="$script_dir/manifest" checkout="${script_dir%/*}" commit in_repo key
+  # Variables that point git at another repository must not answer for this one.
+  unset $(git rev-parse --local-env-vars 2>/dev/null) 2>/dev/null || true
+  if [ -f "$manifest" ]; then
+    commit="$(manifest_field commit)"
+    [ -n "$commit" ] || commit="version $(manifest_field version)"   # before commits were recorded
+    [ "$commit" != "version " ] || commit="(unknown commit)"
+    echo "ai-kit $commit"
+    for key in commit_date:committed installed:installed source:from; do
+      [ -z "$(manifest_field "${key%%:*}")" ] || printf '  %-10s%s\n' "${key#*:}" "$(manifest_field "${key%%:*}")"
+    done
+  elif [ "${script_dir##*/}" = bin ] && [ -f "$checkout/install.sh" ] \
+       && in_repo="$(git -C "$checkout" rev-parse --show-prefix 2>/dev/null)" && [ -z "$in_repo" ] \
+       && commit="$(git -C "$checkout" rev-parse --verify -q HEAD)"; then
+    [ -z "$(git --no-optional-locks -C "$checkout" status --porcelain --untracked-files=normal 2>/dev/null || echo failed)" ] \
+      || commit="$commit-dirty"
+    echo "ai-kit $commit"
+    printf '  %-10s%s (source checkout, not installed)\n' from "$checkout" | LC_ALL=C tr -d '\000-\011\013-\037\177'
+  else
+    echo "ai-kit (unknown commit)"
+  fi
+  exit 0
+}
+# manifest_field <key> — the first recorded value, without control characters.
+manifest_field() {
+  sed -n "s/^$1=//p" "$script_dir/manifest" | head -1 | LC_ALL=C tr -d '\000-\037\177'
+}
+
 # ---- Parse arguments -------------------------------------------------------
 use_worktree=0
 agent=""
@@ -189,6 +222,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     -h|--help)
       usage 0
+      ;;
+    -V|--version)
+      version
       ;;
     --)
       shift
