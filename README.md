@@ -18,8 +18,13 @@ git clone https://github.com/Nicholas-Autio-Mitchell/ai-kit.git && cd ai-kit && 
 The installer asks for the payload directory (default
 `${XDG_DATA_HOME:-~/.local/share}/ai-kit`), a directory on your `PATH`
 (`~/.local/bin`) and the command name (`ai`). `-y` accepts the defaults;
-`--prefix DIR`, `--bin-dir DIR` and `--name NAME` set them. Re-run it to upgrade
-in place; `./install.sh --uninstall` (or `<prefix>/uninstall.sh`) removes it.
+`--prefix DIR`, `--bin-dir DIR` and `--name NAME` set them.
+`./install.sh --uninstall` (or `<prefix>/uninstall.sh`) removes it.
+
+To upgrade, `git pull && ./install.sh -y`. The installer finds the existing
+install through its command (in the command directory or on your `PATH`) or at
+the default directory, and reuses its settings; an option you pass still wins.
+It says when it finds none; for an install it cannot find, pass `--prefix DIR`.
 
 Requires Linux or macOS, bash (macOS `/bin/bash` 3.2 works), git 2.31+, and
 `claude` and/or `codex` on your `PATH`. Optional: direnv 2.33+, and python3

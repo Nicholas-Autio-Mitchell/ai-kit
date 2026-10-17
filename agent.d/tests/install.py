@@ -34,6 +34,10 @@ REAL_READLINK = shutil.which("readlink")
 INSTALLERS = ("brew", "port", "apt-get", "apt", "dnf", "yum", "pacman", "zypper",
               "apk", "sudo", "curl", "wget")
 PAYLOAD = {"ai", "agent.d", "uninstall.sh", "VERSION", "manifest"}
+# Every command name a test installs or a re-run probes for. They are hidden
+# from PATH: a re-run finds the install behind the command PATH resolves, and a
+# test must never find (and upgrade) the user's real one.
+COMMAND_NAMES = ("ai", "ai-kit", "kit", "renamed", "third")
 
 
 def command(path, body):
@@ -99,7 +103,7 @@ fi
         for name in INSTALLERS:
             command(cls.tools / name, 'echo "${0##*/} $*" >>"$INSTALL_TEST_INSTALLER_LOG"; exit 1\n')
         cls.path = str(cls.tools) + os.pathsep + path_without(
-            INSTALLERS + ("direnv",), shared_root / "shadow")
+            INSTALLERS + ("direnv",) + COMMAND_NAMES, shared_root / "shadow")
 
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix="ai-kit install tests ")
@@ -219,6 +223,125 @@ fi
         self.assertEqual(self.manifest_links(), [str(self.bindir / "renamed")])
         # The older launchers' wrapper scripts go too; the user's files stay.
         self.assertEqual(set(os.listdir(self.prefix)), PAYLOAD | {"user-note", "user-dir"})
+
+    def reinstall(self, *args, env=None):
+        """Re-run install.sh -y with only `args`: the upgrade a `git pull` user runs."""
+        return self.successful(self.run_script(PACKAGE / "install.sh", "-y", *args, env=env))
+
+    def assert_unchanged_install(self, process):
+        self.assertIn("upgrading ai-kit", process.stderr)
+        self.assertEqual(os.listdir(self.bindir), ["kit"])
+        self.assertEqual((self.bindir / "kit").resolve(), self.prefix / "ai")
+        self.assertEqual(self.manifest_links(), [str(self.bindir / "kit")])
+        manifest = (self.prefix / "manifest").read_text()
+        self.assertIn("bin_dir=%s\n" % self.bindir, manifest)
+        self.assertIn("command=kit\n", manifest)
+        # Nothing laid down at the built-in defaults beside it.
+        self.assertFalse((self.home / ".local").exists())
+
+    def test_rerun_with_only_the_prefix_keeps_the_recorded_settings(self):
+        self.successful(self.install())
+        self.assert_unchanged_install(self.reinstall("--prefix", self.prefix))
+
+    def test_rerun_with_no_options_finds_the_install_through_its_command(self):
+        self.successful(self.install())
+        # Through the link where the command would go...
+        self.assert_unchanged_install(self.reinstall("--bin-dir", self.bindir, "--name", "kit"))
+        # ...and through the command PATH finds, with nothing given at all but its name.
+        self.assert_unchanged_install(self.reinstall(
+            "--name", "kit", env={"PATH": str(self.bindir) + os.pathsep + self.path}))
+
+    def test_rerun_with_no_options_finds_the_install_at_the_default_prefix(self):
+        self.prefix = self.home / ".local/share/ai-kit"
+        self.successful(self.install())
+        self.assertEqual(os.listdir(self.home / ".local"), ["share"])
+        process = self.reinstall()
+        self.assertIn("upgrading ai-kit", process.stderr)
+        self.assertEqual(os.listdir(self.bindir), ["kit"])
+        self.assertEqual((self.bindir / "kit").resolve(), self.prefix / "ai")
+        self.assertEqual(self.manifest_links(), [str(self.bindir / "kit")])
+        self.assertFalse((self.home / ".local/bin").exists())
+
+    def test_rerun_finds_the_install_through_any_link_in_the_command_directory(self):
+        # A custom prefix and name: neither the default prefix nor `ai` leads to it.
+        self.bindir = self.home / ".local/bin"
+        self.successful(self.install())
+        process = self.reinstall()
+        self.assertIn("upgrading ai-kit", process.stderr)
+        self.assertEqual(os.listdir(self.bindir), ["kit"])
+        self.assertEqual((self.bindir / "kit").resolve(), self.prefix / "ai")
+        self.assertFalse((self.home / ".local/share").exists())
+        # Renaming finds it the same way, and moves the one command.
+        self.reinstall("--name", "renamed")
+        self.assertEqual(os.listdir(self.bindir), ["renamed"])
+        self.assertEqual(self.manifest_links(), [str(self.bindir / "renamed")])
+        self.assertFalse((self.home / ".local/share").exists())
+
+    def test_rerun_does_not_guess_between_two_installs_in_the_command_directory(self):
+        self.bindir = self.home / ".local/bin"
+        self.successful(self.install())
+        second = self.root / "second payload"
+        self.successful(self.run_script(PACKAGE / "install.sh", "-y", "--prefix", second,
+                                        "--bin-dir", self.bindir, "--name", "renamed"))
+        before = (self.prefix / "manifest").read_text(), (second / "manifest").read_text()
+        process = self.run_script(PACKAGE / "install.sh", "-y")
+        self.assertEqual(process.returncode, 1, process.stderr)
+        self.assertIn("several ai-kit installs", process.stderr)
+        self.assertIn(str(self.prefix), process.stderr)
+        self.assertIn(str(second), process.stderr)
+        self.assertEqual(((self.prefix / "manifest").read_text(), (second / "manifest").read_text()), before)
+        # The default prefix is preferred to the scan: it is no guess.
+        self.prefix = self.home / ".local/share/ai-kit"
+        self.successful(self.install("--name", "third"))
+        process = self.reinstall()
+        self.assertIn("upgrading ai-kit", process.stderr)
+        self.assertIn("at %s\n" % self.prefix, process.stderr)
+
+    def test_fresh_install_says_it_found_no_install_to_upgrade(self):
+        process = self.reinstall()
+        self.assertIn("No existing install found", process.stderr)
+        self.assertNotIn("upgrading ai-kit", process.stderr)
+        self.assertTrue((self.home / ".local/bin/ai").is_symlink())
+
+    def test_moving_the_prefix_names_the_install_that_owns_the_command(self):
+        self.successful(self.install())
+        elsewhere = self.root / "elsewhere"
+        process = self.run_script(PACKAGE / "install.sh", "-y", "--prefix", elsewhere,
+                                  "--bin-dir", self.bindir, "--name", "kit")
+        self.assertEqual(process.returncode, 1, process.stderr)
+        self.assertIn("is the command of the ai-kit install at %s" % self.prefix, process.stderr)
+        self.assertIn("uninstall.sh", process.stderr)
+        self.assertNotIn("not created by ai-kit", process.stderr)
+        self.assertFalse(elsewhere.exists())
+        self.assertEqual((self.bindir / "kit").resolve(), self.prefix / "ai")
+
+    def test_rerun_keeps_the_recorded_name_when_another_command_shadows_it(self):
+        self.successful(self.install())
+        other = self.root / "other tools"
+        other.mkdir()
+        command(other / "kit", "exit 0\n")
+        process = self.reinstall("--prefix", self.prefix, env={
+            "PATH": os.pathsep.join([str(other), str(self.bindir), self.path])})
+        self.assertIn("'kit' is already a command on your PATH", process.stderr)
+        self.assertNotIn("Suggesting", process.stderr)
+        self.assertEqual(os.listdir(self.bindir), ["kit"])
+
+    def test_rerun_option_still_overrides_a_recorded_setting(self):
+        self.successful(self.install())
+        self.reinstall("--prefix", self.prefix, "--name", "renamed")
+        self.assertEqual(os.listdir(self.bindir), ["renamed"])
+        self.assertEqual(self.manifest_links(), [str(self.bindir / "renamed")])
+
+    def test_rerun_does_not_trust_a_manifest_recording_another_prefix(self):
+        self.successful(self.install())
+        manifest = self.prefix / "manifest"
+        manifest.write_text(manifest.read_text().replace(
+            "prefix=%s\n" % self.prefix, "prefix=%s\n" % (self.root / "elsewhere")))
+        process = self.reinstall("--prefix", self.prefix)
+        self.assertIn("records the prefix '%s'" % (self.root / "elsewhere"), process.stderr)
+        self.assertNotIn("upgrading ai-kit", process.stderr)
+        self.assertIn("command=ai\n", manifest.read_text())
+        self.assertTrue((self.home / ".local/bin/ai").is_symlink())
 
     def test_upgrade_keeps_the_link_a_manifest_recorded_through_a_symlink(self):
         self.successful(self.install())

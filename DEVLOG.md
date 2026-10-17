@@ -12,6 +12,99 @@ Conventions:
 
 ---
 
+## 2026-10-17 — A re-run upgrades the existing install instead of the defaults
+
+**What:** `install.sh` now finds the existing install and takes its recorded
+prefix, `bin_dir` and `command` (from its manifest) as the defaults for the
+three settings. An option you pass still wins. Discovery order (an explicit
+`--prefix` is the only candidate when given):
+
+1. command links by name — the `--name` given, the default `ai`, and `ai-kit`
+   (the alternative the installer suggests) — at `<bin-dir>/<name>` and via
+   `command -v`;
+2. the default prefix;
+3. last resort: every symlink in the command directory. If those lead to more
+   than one install, the run stops, lists them and asks for `--prefix DIR`. It
+   never guesses.
+
+A candidate is trusted only if the directory and its manifest are the user's
+own (`-O`), the manifest is a regular, non-symlink file with the ai-kit header,
+and its `prefix=` equals the directory. That is the same rule `uninstall.sh`
+uses. Manifest values are stripped of control characters, and `bin_dir` is
+reused only if it is absolute. The run says what it found:
+`upgrading ai-kit X -> Y at P` / `Reusing its command, ...`, or
+`No existing install found: installing fresh. (... --prefix DIR.)`. When
+`--prefix` points at a directory whose manifest is untrusted or records a
+different prefix, it warns and reuses nothing. The conflict message now says
+when a link belongs to another ai-kit install and prints the
+`./install.sh --prefix X` and `X/uninstall.sh` commands. Before, it wrongly said
+"not created by ai-kit ... choose a different name". The name-collision warning
+still runs, but for a recorded name it only warns and keeps the name instead of
+suggesting a rename. README gains a "To upgrade, `git pull && ./install.sh -y`"
+paragraph, and the `--help` text describes the new defaults.
+
+**Why:** The owner wants `git pull && ./install.sh` to be a pure upgrade.
+Before this change the three settings always defaulted to the built-ins, so:
+
+- an install made with `--name foo` was silently renamed to `ai` on a `-y`
+  re-run, and `foo` was removed as a "stale link";
+- an install with a custom `--prefix` hit a false
+  "Conflict ... not created by ai-kit" refusal and was never upgraded.
+
+Alternatives weighed:
+
+- (a) A breadcrumb file in the clone's `.git` recording the prefix. Rejected:
+  the test suite and CI run the real clone's `install.sh`, so they would read
+  and write the developer's `.git`. It also adds hidden state.
+- (b) Only document "re-run with the same options". Rejected: that is the
+  footgun this change removes.
+- (c) Scan the command directory first. Demoted to the last-resort fallback
+  after review showed it could silently pick one of two installs by sort order.
+  It now refuses instead.
+
+Known limit: some installs are not found. That is an install with a custom
+prefix, a custom command directory that is not on `PATH`, and a name that is
+not probed. The run says it found no install, and `--prefix DIR` recovers all
+three settings.
+
+**How verified:** `agent.d/tests/install.sh` has 29 tests, 10 of them new (one
+of the 10 covers both the link and the `PATH` route):
+
+- re-run with only `--prefix`;
+- found through its command link and through `PATH`;
+- found at the default prefix;
+- found by the command-directory scan, including a rename;
+- two installs: refuses with the list, and the default prefix is preferred over
+  the scan;
+- fresh-install notice;
+- moving the prefix names the install that owns the command;
+- a recorded name is kept when another command shadows it;
+- an option overrides a recorded setting;
+- a mismatched manifest is not trusted, and the run warns.
+
+The test-engineer reported the suite green under Homebrew bash 5.3 and macOS
+`/bin/bash` 3.2, with codex-launch and direnv-worktree also passing under 3.2.
+Four of the new tests were confirmed to fail against the previous `install.sh`.
+The original failures were reproduced by hand in a scratch `HOME` (custom
+`--name`, custom `--prefix`, custom prefix + name), and each now upgrades in
+place. The chronicler re-ran `agent.d/tests/install.sh` on the final tree before
+committing: 29/29 OK under Homebrew bash 5.3.15 and under `/bin/bash`
+(`INSTALL_TEST_BASH=/bin/bash`). The test harness now hides
+`ai`/`ai-kit`/`kit`/`renamed`/`third` from `PATH`, so discovery can never find
+(and upgrade) the developer's real install.
+
+Review: the critic approved after two rounds and fixes. The security-auditor's
+findings were adopted: M1 (ownership check), M2 (collision warning) and L1/L2
+(input hardening). It accepted L4, symlink-following writes inside a prefix the
+user owns, as same-user behaviour.
+
+**Follow-ups:**
+- `VERSION` is still `1.0.0` after many changes, so the
+  `upgrading ai-kit X -> Y` line cannot show a difference. Bump `VERSION` on
+  releases.
+
+**Commits:** the `fix(install):` commit that carries this entry.
+
 ## 2026-10-13 — A Ctrl-C can no longer cut the scaffold cleanup short
 
 **What:** The INT/TERM/HUP traps in `bin/ai` now ignore further signals before

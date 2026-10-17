@@ -40,12 +40,15 @@ install.sh — install the ai-kit launcher and its subagent team (Linux/macOS).
 usage: ./install.sh [options]
 
 Asks for each setting not given as an option, unless -y is set or stdin is not
-a terminal. Re-running upgrades in place.
+a terminal. Re-running upgrades in place: an existing install's settings become
+the defaults, so after a git pull, ./install.sh -y is all an upgrade needs.
 
 options:
-  --prefix DIR    payload directory (default: \${XDG_DATA_HOME:-~/.local/share}/ai-kit)
-  --bin-dir DIR   directory on your PATH for the command symlink (default: ~/.local/bin)
-  --name NAME     command name (default: ai)
+  --prefix DIR    payload directory (default: the existing install's, else
+                  \${XDG_DATA_HOME:-~/.local/share}/ai-kit)
+  --bin-dir DIR   directory on your PATH for the command symlink (default: the
+                  existing install's, else ~/.local/bin)
+  --name NAME     command name (default: the existing install's, else ai)
   -y, --yes       ask nothing; use the default for each setting not given
   --uninstall     run uninstall.sh with the options that follow (--prefix DIR, -y)
   -h, --help      show this help
@@ -177,6 +180,96 @@ else
   head_ "Setup (non-interactive)"
 fi
 
+# ---- Previous install ------------------------------------------------------
+# Re-running after a `git pull` must upgrade the install that is already there,
+# not lay a second one down with the built-in defaults (or rename its command).
+# Its manifest records the three settings; each one not given as an option
+# defaults to the recorded value.
+
+# install_at <dir> — true when <dir> is an ai-kit install of this user's: the
+# directory and its manifest are theirs, and the manifest records <dir> as its
+# own prefix (a moved or copied manifest is not trusted, as in uninstall.sh).
+install_at() {
+  [ -d "$1" ] && [ -O "$1" ] && [ -f "$1/manifest" ] && [ ! -L "$1/manifest" ] \
+    && [ -O "$1/manifest" ] && grep -qs '^# ai-kit install manifest' "$1/manifest" \
+    && [ "$(sed -n 's/^prefix=//p' "$1/manifest" | head -1)" = "$1" ]
+}
+# install_behind <path> — print the prefix of the install a command link at
+# <path> points into; false when it is not an ai-kit link. `command -v` prints
+# a bare name for a function or builtin, which is never one.
+install_behind() {
+  local t
+  case "$1" in /*) ;; *) return 1 ;; esac
+  [ -L "$1" ] || return 1
+  t="$(ai_realpath "$1")" || return 1
+  install_at "${t%/*}" && printf '%s\n' "${t%/*}"
+}
+# find_install — print the prefix of the existing install. The command link is
+# what the user actually runs, so links come first: by name (the one given, the
+# default, and the alternative this installer suggests) where the command goes
+# and on PATH. Then the default prefix, and last, as a fallback for a custom
+# name, the links in the command directory: every distinct install they lead
+# to, one per line, so that a caller never has to guess between two.
+find_install() {
+  local bin name f p seen=""
+  bin="$(abspath "${BIN_DIR:-$DEFAULT_BIN_DIR}")"
+  for name in ${CMD:+"$CMD"} "$DEFAULT_NAME" ai-kit; do
+    install_behind "$bin/$name" && return 0
+    install_behind "$(command -v -- "$name" 2>/dev/null || true)" && return 0
+  done
+  f="$(abspath "$DEFAULT_PREFIX")"
+  install_at "$f" && { printf '%s\n' "$f"; return 0; }
+  for f in "$bin"/*; do
+    p="$(install_behind "$f")" || continue
+    case "$seen" in *"
+$p
+"*) continue ;; esac
+    seen="$seen
+$p
+"
+    printf '%s\n' "$p"
+  done
+}
+# manifest_value <dir> <key> — a recorded value, without control characters.
+manifest_value() {
+  sed -n "s/^$2=//p" "$1/manifest" | head -1 | tr -d '[:cntrl:]'
+}
+
+# An explicit --prefix is the only candidate.
+found=""
+if [ -n "$PREFIX" ]; then
+  PREFIX="$(abspath "$PREFIX")"
+  if install_at "$PREFIX"; then
+    found="$PREFIX"
+  elif grep -qs '^# ai-kit install manifest' "$PREFIX/manifest"; then
+    warn "$PREFIX/manifest records the prefix '$(manifest_value "$PREFIX" prefix)', or is not"
+    say  "    yours; its command directory and name are not reused."
+  fi
+else
+  found="$(find_install)" || found=""
+  case "$found" in
+    *"
+"*)
+      warn "the command directory holds the commands of several ai-kit installs:"
+      printf '%s\n' "$found" | while IFS= read -r p; do say "      $p"; done
+      die "choose the one to upgrade with --prefix DIR." ;;
+  esac
+fi
+
+prev_cmd=""
+if [ -n "$found" ]; then
+  prev_bin_dir="$(manifest_value "$found" bin_dir)"
+  prev_cmd="$(manifest_value "$found" command)"
+  DEFAULT_PREFIX="$found"
+  case "$prev_bin_dir" in /*) DEFAULT_BIN_DIR="$prev_bin_dir" ;; esac
+  DEFAULT_NAME="${prev_cmd:-$DEFAULT_NAME}"
+  ok "upgrading ai-kit $(manifest_value "$found" version) -> $VERSION at $found"
+  say "    Reusing its command, $DEFAULT_BIN_DIR/$DEFAULT_NAME; an option overrides it."
+elif [ -z "$PREFIX" ]; then
+  say "  No existing install found: installing fresh. (To upgrade one this did not"
+  say "  find, re-run with --prefix DIR.)"
+fi
+
 [ -n "$PREFIX" ]  || PREFIX="$(ask  "Install directory for the tool itself?" "$DEFAULT_PREFIX")"
 PREFIX="$(abspath "$PREFIX")"
 
@@ -187,14 +280,18 @@ case "$BIN_DIR" in
 esac
 
 # Command name, with collision detection. This is the question that keeps the
-# package from stepping on another tool: 'ai' is a short, popular name.
+# package from stepping on another tool: 'ai' is a short, popular name. A name
+# the previous install recorded stays the default; a clash is only reported.
 if [ -z "$CMD" ]; then
   suggested="$DEFAULT_NAME"
   existing="$(command -v "$DEFAULT_NAME" 2>/dev/null || true)"
-  if [ -n "$existing" ] && [ "$existing" != "$BIN_DIR/$DEFAULT_NAME" ]; then
+  if [ -n "$existing" ] && [ "$existing" != "$BIN_DIR/$DEFAULT_NAME" ] \
+     && [ "$(install_behind "$existing" || true)" != "$PREFIX" ]; then
     warn "'$DEFAULT_NAME' is already a command on your PATH: $existing"
-    suggested="ai-kit"
-    say  "    Suggesting '$suggested' instead so nothing is shadowed."
+    if [ -z "$prev_cmd" ]; then
+      suggested="ai-kit"
+      say  "    Suggesting '$suggested' instead so nothing is shadowed."
+    fi
   fi
   CMD="$(ask "Command name?" "$suggested")"
 fi
@@ -225,13 +322,25 @@ done
 
 if [ "${#conflicts[@]}" -gt 0 ]; then
   head_ "Conflict"
-  say "  These already exist and were not created by ai-kit:"
+  other=""
   for c in "${conflicts[@]}"; do
-    say "    $c  ->  $(readlink "$c" 2>/dev/null || echo '(not a symlink)')"
+    if owner="$(install_behind "$c")"; then
+      say "  $c is the command of the ai-kit install at $owner."
+      other="$owner"
+    else
+      say "  $c already exists and was not created by ai-kit:"
+      say "    $c  ->  $(readlink "$c" 2>/dev/null || echo '(not a symlink)')"
+    fi
   done
   say ""
-  say "  Nothing has been changed. Re-run with a different name, e.g.:"
-  say "    ./install.sh --name ${CMD}-kit"
+  say "  Nothing has been changed."
+  if [ -n "$other" ]; then
+    say "  To upgrade that install:  ./install.sh --prefix $(printf '%q' "$other")"
+    say "  To move it, remove it first ($(printf '%q' "$other")/uninstall.sh), then install again."
+  else
+    say "  Re-run with a different name, e.g.:"
+    say "    ./install.sh --name ${CMD}-kit"
+  fi
   exit 1
 fi
 
